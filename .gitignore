@@ -1,7 +1,6 @@
 .env
-config.yaml
-resume.txt
 seen_jobs.json
+seen_jobs.json.tmp
 __pycache__/
 *.pyc
 .venv/

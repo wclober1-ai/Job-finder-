@@ -1,115 +1,69 @@
 # Job Monitor
 
-Python script that checks company career pages on a schedule, finds **new** job postings, scores how well your resume matches each role with Anthropic Claude (1–10), and emails you only when the score is **7 or higher**.
+Python script that checks a list of company career pages every 24 hours, finds **new** job postings that match target keywords, scores them against your resume with Anthropic Claude, and emails a digest only when jobs score **7 or higher**.
 
-Previously seen jobs are stored in `seen_jobs.json` so you are only notified about new postings. Playwright is used so dynamically rendered career pages work.
+## What it does
 
-## Features
-
-- Configurable list of company career URLs + CSS selectors
-- Playwright (Chromium) scraping for JS-heavy boards (Greenhouse, Lever, custom SPAs)
-- Claude match scoring with a short reason
-- Email alerts only for scores ≥ threshold (default 7)
-- JSON persistence of seen jobs (id, title, URL, score, notified flag)
-- Runs once (`--once`) or every 24 hours by default
+1. **Scrape** — Playwright loads each career URL (handles JavaScript-rendered pages) and extracts job titles + links
+2. **Filter** — Keeps titles containing: coordinator, associate, account, marketing, partnerships, events, creative, communications, brand
+3. **Deduplicate** — Compares against `seen_jobs.json` so each posting is only processed once
+4. **Score** — Sends job + resume to Claude (`claude-sonnet-4-6`) for a 1–10 match score
+5. **Email** — If any jobs score ≥ 7, sends one Gmail digest to `wclober1@gmail.com`
+6. **Schedule** — APScheduler re-runs the pipeline every 24 hours
 
 ## Setup
 
 ```bash
+# 1. Create a virtual environment
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+
+# 2. Install dependencies
 pip install -r requirements.txt
 playwright install chromium
 
+# 3. Configure secrets
 cp .env.example .env
-cp config.example.yaml config.yaml
-cp resume.example.txt resume.txt
 ```
 
-Edit:
+Edit `.env` and fill in:
 
-1. **`.env`** — `ANTHROPIC_API_KEY`, SMTP settings, and `EMAIL_TO`
-2. **`config.yaml`** — company career URLs and CSS selectors for job links
-3. **`resume.txt`** — your resume as plain text
+| Variable | Description |
+| --- | --- |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key |
+| `GMAIL_ADDRESS` | Sender Gmail address (default: `wclober1@gmail.com`) |
+| `GMAIL_APP_PASSWORD` | [Gmail App Password](https://support.google.com/accounts/answer/185833) (16 characters) |
 
-### Gmail note
-
-Use an [App Password](https://support.google.com/accounts/answer/185833) with `SMTP_HOST=smtp.gmail.com` and `SMTP_PORT=587`.
+> **Gmail tip:** Regular account passwords usually fail with SMTP. Enable 2-Step Verification, then create an App Password and put that in `GMAIL_APP_PASSWORD`.
 
 ## Usage
 
-Single check:
+Run the pipeline once (manual trigger):
 
 ```bash
 python job_monitor.py --once
 ```
 
-Continuous monitor (default every 24 hours; runs once immediately, then on the interval):
+Run on a 24-hour schedule (runs immediately, then every 24 hours):
 
 ```bash
 python job_monitor.py
 ```
 
-Options:
+Press `Ctrl+C` to stop the scheduler.
 
-```text
---config PATH   Config file (default: config.yaml)
---once          Run one pass and exit
--v / --verbose  Debug logging
-```
+## Files
 
-## Config
+| File | Purpose |
+| --- | --- |
+| `job_monitor.py` | Main script (career URLs + resume are hardcoded here) |
+| `.env` | Secrets (not committed to git) |
+| `seen_jobs.json` | Created automatically; stores previously seen titles/URLs |
+| `requirements.txt` | Python dependencies |
 
-Each company entry needs:
+## Notes
 
-| Field | Required | Meaning |
-| --- | --- | --- |
-| `name` | yes | Display name in emails / logs |
-| `url` | yes | Careers listing page |
-| `job_link_selector` | yes | CSS selector for links to individual jobs |
-| `wait_for_selector` | no | Wait until this appears (SPA listings) |
-| `description_selector` | no | On the detail page, extract this element; else use full body text |
-
-Environment overrides: `SCORE_THRESHOLD`, `CHECK_INTERVAL_HOURS`, `CLAUDE_MODEL`.
-
-## Seen jobs file
-
-`seen_jobs.json` looks like:
-
-```json
-{
-  "jobs": {
-    "a1b2c3...": {
-      "company": "Example Corp",
-      "title": "Senior Engineer",
-      "url": "https://example.com/jobs/123",
-      "first_seen": "2026-07-13T02:00:00+00:00",
-      "score": 8,
-      "reason": "Strong overlap with Python backend experience.",
-      "notified": true
-    }
-  }
-}
-```
-
-Job IDs are a hash of the normalized job URL. Delete an entry (or the whole file) to re-process a posting.
-
-## How scoring works
-
-For each new job, the script sends your resume and the job description to Claude and expects JSON:
-
-```json
-{"score": 8, "reason": "Strong backend Python overlap; less cloud infra depth."}
-```
-
-Only scores ≥ `score_threshold` (default 7) trigger an email.
-
-## Tips for selectors
-
-Inspect a careers page and pick a selector that matches **individual** job links, for example:
-
-- Greenhouse: `a[href*="/jobs/"]`
-- Lever: `a.posting-title`
-- Custom: `.careers-list a.job-title`
-
-Prefer a `description_selector` that targets the posting body so Claude is not flooded with nav/footer noise.
+- If one career page fails to load, the error is logged and the script continues to the next URL
+- Console prints status updates throughout each run
+- No email is sent on days when nothing scores 7 or higher
+- Delete an entry from `seen_jobs.json` (or the whole file) to re-process a posting
