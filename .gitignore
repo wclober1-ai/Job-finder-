@@ -1,0 +1,11 @@
+.env
+config.yaml
+resume.txt
+seen_jobs.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/

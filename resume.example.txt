@@ -1,0 +1,22 @@
+Jane Doe
+San Francisco Bay Area | jane@example.com | github.com/janedoe
+
+SUMMARY
+Software engineer with 5+ years building backend services and data pipelines.
+Comfortable with Python, TypeScript, PostgreSQL, and cloud infrastructure.
+
+EXPERIENCE
+Senior Software Engineer — Example Labs (2022–Present)
+- Built APIs serving 2M requests/day in Python (FastAPI) and TypeScript
+- Led migration of batch jobs to event-driven workers on AWS
+- Mentored three engineers; improved on-call runbooks
+
+Software Engineer — Startup Co (2019–2022)
+- Shipped customer-facing features end-to-end
+- Reduced CI time by 40% and introduced integration test suites
+
+EDUCATION
+B.S. Computer Science — State University
+
+SKILLS
+Python, TypeScript, SQL, Docker, Kubernetes, AWS, Playwright, Anthropic API
