@@ -1,85 +1,226 @@
 #!/usr/bin/env python3
 """
-Job board monitor: scrape career pages, score new roles with Claude, email strong matches.
+Job monitoring script.
 
-Runs on a 24-hour schedule by default. Uses Playwright so dynamically rendered
-career sites (Greenhouse, Lever, custom SPAs, etc.) work reliably.
+Every 24 hours (or when run manually), this script:
+  1. Scrapes a list of company career pages with Playwright
+  2. Keeps only jobs whose titles match target keywords
+  3. Skips jobs already stored in seen_jobs.json
+  4. Scores new jobs against a hardcoded resume via Claude
+  5. Emails a daily digest of jobs scoring 7+ to Gmail
+
+Run once:       python job_monitor.py --once
+Run on schedule: python job_monitor.py
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import logging
 import os
 import re
 import smtplib
 import sys
-import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from email.message import EmailMessage
+import traceback
+from datetime import datetime
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-import schedule
-import yaml
 from anthropic import Anthropic
+from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
-from playwright.sync_api import Browser, Page, sync_playwright
-
-logger = logging.getLogger("job_monitor")
-
-DEFAULT_MODEL = "claude-sonnet-4-20250514"
-DEFAULT_THRESHOLD = 7
-DEFAULT_INTERVAL_HOURS = 24
-NAV_TIMEOUT_MS = 45_000
-BODY_TEXT_LIMIT = 12_000
-
+from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------------------------------
-# Data models
+# Paths & constants
 # ---------------------------------------------------------------------------
 
+# Directory this script lives in (used for seen_jobs.json)
+BASE_DIR = Path(__file__).resolve().parent
+SEEN_JOBS_PATH = BASE_DIR / "seen_jobs.json"
 
-@dataclass
-class CompanyConfig:
-    name: str
-    url: str
-    job_link_selector: str
-    wait_for_selector: str | None = None
-    description_selector: str | None = None
+# Claude settings (as specified)
+CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_MAX_TOKENS = 200
+SCORE_THRESHOLD = 7
 
+# How long Playwright waits for pages (milliseconds)
+PAGE_TIMEOUT_MS = 45_000
 
-@dataclass
-class AppConfig:
-    resume_path: Path
-    seen_jobs_path: Path
-    score_threshold: int
-    check_interval_hours: int
-    claude_model: str
-    companies: list[CompanyConfig]
+# Cap description length sent to Claude so prompts stay reasonable
+DESCRIPTION_CHAR_LIMIT = 8_000
 
+# Case-insensitive title keywords — a job is kept if ANY match
+KEYWORDS = [
+    "coordinator",
+    "associate",
+    "account",
+    "marketing",
+    "partnerships",
+    "events",
+    "creative",
+    "communications",
+    "brand",
+]
 
-@dataclass
-class JobPosting:
-    company: str
-    title: str
-    url: str
-    description: str
-    job_id: str = field(init=False)
+# ---------------------------------------------------------------------------
+# Career pages to monitor (duplicates removed; spaced domains fixed)
+# ---------------------------------------------------------------------------
 
-    def __post_init__(self) -> None:
-        self.job_id = _stable_job_id(self.url)
+CAREER_URLS = [
+    "https://careers.gtb.com",
+    "https://www.woolpert.com/careers",
+    "https://www.livenation.com/careers",
+    "https://www.altrarunning.com/careers",
+    "https://www.rothys.com/pages/careers",
+    "https://www.waremalcomb.com/careers",
+    "https://warriors.com/careers",
+    "https://leoburnett.com/careers",
+    "https://www.ddb.com/careers",
+    "https://www.goodbysilverstein.com/careers",
+    "https://careers.kraftheinzcompany.com",
+    "https://careers.mondelezinternational.com",
+    "https://careers.conagrabrands.com",
+    "https://www.abbott.com/careers",
+    "https://www.ingredion.com/careers",
+    "https://careers.mars.com",
+    "https://www.fairlife.com/careers",
+    "https://www.reynoldsconsumerproducts.com/careers",
+    "https://www.fortunebrands.com/careers",
+    "https://www.world.kitchen/careers",
+    "https://www.azekco.com/careers",
+    "https://www.treehousefoods.com/careers",
+    "https://www.lifeway.net/careers",
+    "https://www.usfoods.com/careers",
+    "https://www.blistex.com/careers",
+    "https://www.unilever.com/careers",
+    "https://www.crateandbarrel.com/careers",
+    "https://www.wilson.com/en-us/careers",
+    "https://www.shopakira.com/careers",
+    "https://www.threadless.com/careers",
+    "https://www.fossilgroup.com/careers",
+    "https://careers.levistrauss.com",
+    "https://www.pvh.com/careers",
+    "https://www.hanesbrands.com/careers",
+    "https://www.cintas.com/careers",
+    "https://www.wolverineworldwide.com/careers",
+    "https://www.randabrands.com/careers",
+    "https://www.bradfordexchange.com/careers",
+    "https://www.weathertech.com/careers",
+    "https://www.dainese.com/us/en/careers",
+    "https://www.americanapparel.com/careers",
+    "https://www.medline.com/careers",
+    "https://www.baxter.com/careers",
+    "https://www.pfizer.com/careers",
+    "https://www.zebra.com/careers",
+    "https://www.acco.com/careers",
+    "https://jobs.groupon.com",
+    "https://www.morningstar.com/careers",
+    "https://www.usg.com/careers",
+    "https://www.brunswick.com/careers",
+    "https://www.itw.com/careers",
+    "https://www.stepan.com/careers",
+    "https://www.ryerson.com/careers",
+    "https://www.kemper.com/careers",
+    "https://www.cliffbar.com/our-company/careers",
+    "https://www.harmlessharvest.com/pages/careers",
+    "https://www.fairytalebrownies.com/careers",
+    "https://www.dreyers.com/careers",
+    "https://careers.nestle.com",
+    "https://www.clorox.com/careers",
+    "https://www.del-monte.com/en/careers",
+    "https://www.readyrefresh.com/careers",
+    "https://www.guldensmustard.com/careers",
+    "https://www.philzcoffee.com/careers",
+    "https://www.ghirardelli.com/careers",
+    "https://www.tasteofnature.com/careers",
+    "https://www.miyokos.com/pages/careers",
+    "https://www.ripplefoods.com/careers",
+    "https://www.impossiblefoods.com/careers",
+    "https://www.notmilk.com/careers",
+    "https://www.sossupreme.com/careers",
+    "https://www.evolvausa.com/careers",
+    "https://www.rebbl.co/pages/careers",
+    "https://www.kiva.com/careers",
+    "https://www.allbirds.com/pages/careers",
+    "https://www.everlane.com/careers",
+    "https://www.gap.com/careers",
+    "https://www.gapinc.com/careers",
+    "https://www.levi.com/US/en_US/careers",
+    "https://www.cuyana.com/careers",
+    "https://www.thirdlove.com/pages/careers",
+    "https://www.marinelayer.com/pages/careers",
+    "https://www.dollskill.com/pages/careers",
+    "https://www.outerknown.com/pages/careers",
+    "https://www.buckmason.com/pages/careers",
+    "https://www.taylorstitch.com/pages/careers",
+    "https://www.madewell.com/careers",
+    "https://www.betabrand.com/careers",
+    "https://www.aviatornation.com/pages/careers",
+    "https://www.quayaustralia.com/pages/careers",
+    "https://www.stance.com/pages/careers",
+    "https://www.tracksmith.com/pages/careers",
+    "https://www.vuori.com/pages/careers",
+    "https://www.henkel.com/careers",
+    "https://www.pg.com/careers",
+    "https://www.bayer.com/careers",
+    "https://www.abbvie.com/careers",
+    "https://www.genentech.com/careers",
+    "https://www.gilead.com/careers",
+    "https://www.rigel.com/careers",
+    "https://www.natus.com/careers",
+    "https://www.coopersurgical.com/careers",
+    "https://www.genomichealth.com/careers",
+    "https://www.invitae.com/careers",
+    "https://www.formatherapeutics.com/careers",
+    "https://www.veeva.com/careers",
+    "https://www.natera.com/careers",
+    "https://www.guardanthealth.com/careers",
+    "https://www.10xgenomics.com/careers",
+    "https://www.fluidigm.com/careers",
+    "https://www.pacificbiosciences.com/careers",
+]
 
+# ---------------------------------------------------------------------------
+# Hardcoded resume text used for Claude match scoring
+# ---------------------------------------------------------------------------
 
-@dataclass
-class MatchResult:
-    job: JobPosting
-    score: int
-    reason: str
+RESUME_TEXT = """
+I keep things moving and people aligned. From coordinating multi-channel campaigns for major brands to managing vendors, timelines, and tenant communications on the ground, I've built a reputation for being the person who holds things together when the pace picks up. Detail-oriented by nature, proactive by habit.
+
+GS&F — Freelance Marketing Copywriter / Marketing Copywriter Intern, June 2025–September 2025
+
+Pitched and sold a digital campaign to LP Solutions, then led execution through to completion
+Functioned as a central point of contact for clients including LP Solutions, Bridgestone, and Guthrie's Fried Chicken, managing confidential client information and deliverables across accounts under NDA
+Contributed to digital campaign development for Guthrie's Fried Chicken's sponsorship partnership with University of Alabama Athletics
+
+H/L Agency — Marketing Copywriter Intern, June 2024–August 2024
+
+Coordinated production timelines and deliverables across social, radio, and video assets for McDonald's and Toyota
+Supported social media campaigns for Toyota's sponsorship partnership with the San Francisco Giants
+Participated in creative and client reviews, tracking action items and communicating project status
+
+Allen Hall Advertising — Copywriter, May 2023–June 2024
+
+Planned and executed an experiential brand activation for PeaceHealth Rides, organizing a 10+ business partner network and managing logistics to drive bikeshare users to partner locations
+Tracked deliverables, deadlines, and budgets for the Oregon Innovation Challenge, coordinating speaker events, digital content, and an annual winners publication
+
+Trinity College Dublin — Digital Marketing Intern, June 2023–August 2023
+
+Analyzed and presented quarterly room rental profit reports, surfacing insights to improve scheduling and utilization
+Revamped event coordination process and managed 50+ bookings, improving scheduling accuracy and resource utilization
+
+Property Management Assistant, Linden Laurel LLC, November 2025–Present
+
+Coordinated renovation timelines for vacant units, managing contractors and vendors to ensure projects were completed on schedule
+Fielded confidential tenant, vendor, and ownership communications as primary point of contact
+Managed renovation timelines for vacant units, coordinating action items with contractors and vendors
+
+Skills: Account Coordination, Cross-Functional Collaboration, Sponsorship Marketing, Project Coordination, Vendor Management, Digital Campaign Support, Asset Management, Presentation Development, Invoice Tracking, Microsoft Office Suite, Adobe Creative Suite, Google Workspace, AI Tools
+University of Oregon — B.S. in Advertising, Minor in Business Administration, 2020–2024
+""".strip()
 
 
 # ---------------------------------------------------------------------------
@@ -87,507 +228,507 @@ class MatchResult:
 # ---------------------------------------------------------------------------
 
 
-def _stable_job_id(url: str) -> str:
-    """Normalize a job URL into a stable id for de-duplication."""
-    parsed = urlparse(url.strip())
-    # Drop fragment and common tracking query params while keeping path identity.
-    path = parsed.path.rstrip("/") or "/"
-    normalized = f"{parsed.scheme}://{parsed.netloc.lower()}{path}".lower()
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+def log(message: str) -> None:
+    """Print a timestamped status update to the console."""
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{stamp}] {message}", flush=True)
 
 
-def _clean_text(text: str) -> str:
-    text = text.replace("\xa0", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+def company_name_from_url(url: str) -> str:
+    """Derive a readable company name from a career page URL."""
+    host = urlparse(url).netloc.lower()
+    # Strip leading www. / careers.
+    host = re.sub(r"^(www\.|careers\.|jobs\.)", "", host)
+    # Use the first label (e.g. kraftheinzcompany from kraftheinzcompany.com)
+    label = host.split(".")[0] if host else url
+    return label.replace("-", " ").title()
 
 
-def _title_from_link(text: str, href: str) -> str:
-    title = _clean_text(text)
-    if title:
-        return title[:200]
-    # Fall back to a readable path segment
-    path = urlparse(href).path.rstrip("/").split("/")
-    return path[-1].replace("-", " ").replace("_", " ").title() if path else href
+def job_key(title: str, url: str) -> str:
+    """Stable key for de-duplication in seen_jobs.json."""
+    return f"{title.strip().lower()}|{url.strip().lower()}"
+
+
+def matches_keywords(title: str) -> bool:
+    """Return True if the job title contains any of the target keywords."""
+    lower = title.lower()
+    return any(keyword in lower for keyword in KEYWORDS)
 
 
 # ---------------------------------------------------------------------------
-# Config / storage
+# Step 3 — seen_jobs.json persistence
 # ---------------------------------------------------------------------------
 
 
-def load_config(path: Path) -> AppConfig:
-    with path.open(encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
-
-    companies_raw = raw.get("companies") or []
-    if not companies_raw:
-        raise ValueError(f"No companies configured in {path}")
-
-    companies = [
-        CompanyConfig(
-            name=c["name"],
-            url=c["url"],
-            job_link_selector=c["job_link_selector"],
-            wait_for_selector=c.get("wait_for_selector"),
-            description_selector=c.get("description_selector"),
-        )
-        for c in companies_raw
-    ]
-
-    base = path.parent
-    resume = Path(raw.get("resume_path", "resume.txt"))
-    seen = Path(raw.get("seen_jobs_path", "seen_jobs.json"))
-    if not resume.is_absolute():
-        resume = base / resume
-    if not seen.is_absolute():
-        seen = base / seen
-
-    return AppConfig(
-        resume_path=resume,
-        seen_jobs_path=seen,
-        score_threshold=int(
-            os.getenv("SCORE_THRESHOLD", raw.get("score_threshold", DEFAULT_THRESHOLD))
-        ),
-        check_interval_hours=int(
-            os.getenv(
-                "CHECK_INTERVAL_HOURS",
-                raw.get("check_interval_hours", DEFAULT_INTERVAL_HOURS),
-            )
-        ),
-        claude_model=os.getenv(
-            "CLAUDE_MODEL", raw.get("claude_model", DEFAULT_MODEL)
-        ),
-        companies=companies,
-    )
-
-
-def load_seen_jobs(path: Path) -> dict[str, Any]:
-    if not path.exists():
+def load_seen_jobs() -> dict[str, Any]:
+    """Load previously seen job titles/URLs from seen_jobs.json."""
+    if not SEEN_JOBS_PATH.exists():
         return {"jobs": {}}
-    with path.open(encoding="utf-8") as f:
-        data = json.load(f)
-    if "jobs" not in data or not isinstance(data["jobs"], dict):
-        data["jobs"] = {}
-    return data
+    try:
+        with SEEN_JOBS_PATH.open(encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or "jobs" not in data:
+            return {"jobs": {}}
+        return data
+    except (json.JSONDecodeError, OSError) as exc:
+        log(f"Warning: could not read {SEEN_JOBS_PATH} ({exc}); starting fresh.")
+        return {"jobs": {}}
 
 
-def save_seen_jobs(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+def save_seen_jobs(data: dict[str, Any]) -> None:
+    """Write seen jobs back to disk (atomic replace)."""
+    tmp = SEEN_JOBS_PATH.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
-    tmp.replace(path)
-
-
-def load_resume(path: Path) -> str:
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Resume file not found: {path}. Copy resume.example.txt to resume.txt."
-        )
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
-        raise ValueError(f"Resume file is empty: {path}")
-    return text
+    tmp.replace(SEEN_JOBS_PATH)
 
 
 # ---------------------------------------------------------------------------
-# Scraping (Playwright)
+# Step 1 — Scrape career pages with Playwright
 # ---------------------------------------------------------------------------
 
 
-def _collect_job_links(page: Page, company: CompanyConfig) -> list[tuple[str, str]]:
-    """Return unique (title, absolute_url) pairs from a listing page."""
-    wait_sel = company.wait_for_selector or company.job_link_selector
-    try:
-        page.wait_for_selector(wait_sel, timeout=NAV_TIMEOUT_MS)
-    except Exception:
-        logger.warning(
-            "Timed out waiting for %s on %s — continuing with whatever loaded",
-            wait_sel,
-            company.url,
-        )
+def extract_job_links(page, page_url: str) -> list[dict[str, str]]:
+    """
+    Pull job title text and hrefs from the loaded page.
 
-    # Scroll to trigger lazy-loaded listings
-    for _ in range(4):
+    Many career sites use different markup, so we collect all anchors with
+    visible text and keep ones that look like individual postings.
+    """
+    # Scroll a few times to trigger lazy-loaded listings
+    for _ in range(3):
         page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(500)
 
-    anchors = page.query_selector_all(company.job_link_selector)
-    seen_urls: set[str] = set()
-    results: list[tuple[str, str]] = []
+    raw_links = page.eval_on_selector_all(
+        "a",
+        """elements => elements.map(el => ({
+            text: (el.innerText || el.textContent || '').trim(),
+            href: el.getAttribute('href') || ''
+        }))""",
+    )
 
-    for anchor in anchors:
-        href = anchor.get_attribute("href")
-        if not href or href.startswith(("javascript:", "mailto:", "#")):
+    results: list[dict[str, str]] = []
+    seen_hrefs: set[str] = set()
+
+    for item in raw_links:
+        text = (item.get("text") or "").strip()
+        href = (item.get("href") or "").strip()
+        if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
             continue
-        absolute = urljoin(company.url, href)
-        # Skip pure listing roots that aren't individual postings when possible
-        if absolute.rstrip("/") == company.url.rstrip("/"):
+        if not text or len(text) < 3:
             continue
-        if absolute in seen_urls:
+        # Skip very long nav blobs
+        if len(text) > 200:
             continue
-        seen_urls.add(absolute)
-        title = _title_from_link(anchor.inner_text() or "", absolute)
-        results.append((title, absolute))
+
+        absolute = urljoin(page_url, href)
+        if absolute.rstrip("/") == page_url.rstrip("/"):
+            continue
+        if absolute in seen_hrefs:
+            continue
+
+        # Prefer links that look job-related; still keep keyword matches later
+        path = urlparse(absolute).path.lower()
+        jobish = any(
+            token in path
+            for token in (
+                "/job",
+                "/jobs",
+                "/career",
+                "/careers",
+                "/position",
+                "/opening",
+                "/vacancy",
+                "/role",
+                "/apply",
+                "greenhouse",
+                "lever.co",
+                "workday",
+                "icims",
+                "smartrecruiters",
+                "jobvite",
+                "ashbyhq",
+            )
+        )
+        # Keep if path looks job-related OR title will pass keyword filter later
+        if not jobish and not matches_keywords(text):
+            continue
+
+        seen_hrefs.add(absolute)
+        results.append({"title": text.split("\n")[0].strip(), "url": absolute})
 
     return results
 
 
-def _extract_description(page: Page, company: CompanyConfig) -> str:
-    if company.description_selector:
-        try:
-            page.wait_for_selector(company.description_selector, timeout=15_000)
-            parts = [
-                el.inner_text()
-                for el in page.query_selector_all(company.description_selector)
-                if el
-            ]
-            text = _clean_text("\n\n".join(parts))
-            if text:
-                return text[:BODY_TEXT_LIMIT]
-        except Exception:
-            logger.debug(
-                "description_selector %s failed on %s; falling back to body",
-                company.description_selector,
-                page.url,
-            )
-
-    body = page.inner_text("body")
-    return _clean_text(body)[:BODY_TEXT_LIMIT]
-
-
-def scrape_company(browser: Browser, company: CompanyConfig) -> list[JobPosting]:
-    context = browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (compatible; JobMonitor/1.0; +https://github.com/local/job-monitor)"
-        ),
-        viewport={"width": 1280, "height": 900},
-    )
-    page = context.new_page()
-    page.set_default_timeout(NAV_TIMEOUT_MS)
-
-    jobs: list[JobPosting] = []
+def fetch_job_description(page, job_url: str) -> str:
+    """Load a job detail page and return cleaned body text (best-effort)."""
     try:
-        logger.info("Fetching listings for %s (%s)", company.name, company.url)
-        page.goto(company.url, wait_until="domcontentloaded")
-        links = _collect_job_links(page, company)
-        logger.info("Found %d job link(s) on %s", len(links), company.name)
-
-        for title, job_url in links:
-            try:
-                page.goto(job_url, wait_until="domcontentloaded")
-                description = _extract_description(page, company)
-                # Prefer the page <title> / h1 if the listing text was sparse
-                if len(title) < 4:
-                    h1 = page.query_selector("h1")
-                    if h1 and h1.inner_text().strip():
-                        title = _clean_text(h1.inner_text())[:200]
-                jobs.append(
-                    JobPosting(
-                        company=company.name,
-                        title=title,
-                        url=job_url,
-                        description=description or "(No description extracted)",
-                    )
-                )
-            except Exception:
-                logger.exception("Failed to scrape job page %s", job_url)
-    except Exception:
-        logger.exception("Failed to scrape company page %s", company.url)
-    finally:
-        context.close()
-
-    return jobs
+        page.goto(job_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        page.wait_for_timeout(1_000)
+        text = page.inner_text("body")
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        return text[:DESCRIPTION_CHAR_LIMIT]
+    except Exception as exc:
+        log(f"  Could not load description for {job_url}: {exc}")
+        return ""
 
 
-def scrape_all(companies: list[CompanyConfig]) -> list[JobPosting]:
-    all_jobs: list[JobPosting] = []
+def scrape_career_pages() -> list[dict[str, str]]:
+    """
+    Visit every career URL with Playwright and collect job title + link pairs.
+
+    If one page fails, log the error and continue to the next URL.
+    """
+    all_jobs: list[dict[str, str]] = []
+    log(f"Starting scrape of {len(CAREER_URLS)} career pages...")
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        try:
-            for company in companies:
-                all_jobs.extend(scrape_company(browser, company))
-        finally:
-            browser.close()
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 900},
+        )
+        page = context.new_page()
+        page.set_default_timeout(PAGE_TIMEOUT_MS)
+
+        for i, url in enumerate(CAREER_URLS, start=1):
+            company = company_name_from_url(url)
+            log(f"[{i}/{len(CAREER_URLS)}] Scraping {company}: {url}")
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+                page.wait_for_timeout(1_500)
+                links = extract_job_links(page, url)
+                log(f"  Found {len(links)} candidate link(s)")
+                for link in links:
+                    all_jobs.append(
+                        {
+                            "title": link["title"],
+                            "url": link["url"],
+                            "company": company,
+                            "source_url": url,
+                        }
+                    )
+            except Exception as exc:
+                # Graceful failure: one bad page must not crash the whole run
+                log(f"  ERROR scraping {url}: {exc}")
+                traceback.print_exc()
+
+        context.close()
+        browser.close()
+
+    log(f"Scrape complete. Total candidate links: {len(all_jobs)}")
     return all_jobs
 
 
 # ---------------------------------------------------------------------------
-# Claude scoring
+# Step 2 — Keyword filter
 # ---------------------------------------------------------------------------
 
 
-def score_job(
+def filter_by_keywords(jobs: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Keep only jobs whose titles contain at least one keyword."""
+    filtered = [j for j in jobs if matches_keywords(j["title"])]
+    log(
+        f"Keyword filter: {len(filtered)} of {len(jobs)} jobs match "
+        f"({', '.join(KEYWORDS)})"
+    )
+    return filtered
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — Score against resume with Claude
+# ---------------------------------------------------------------------------
+
+
+def score_job_with_claude(
     client: Anthropic,
-    model: str,
-    resume: str,
-    job: JobPosting,
-) -> MatchResult:
-    prompt = f"""You are helping a job seeker decide whether to apply.
+    title: str,
+    description: str,
+) -> dict[str, Any]:
+    """
+    Ask Claude to score the resume against this role.
 
-Score how well the candidate's resume matches this job on a scale of 1-10.
-Be practical: 10 = excellent fit, 7 = strong enough to apply, 4 = weak, 1 = irrelevant.
-
-Return ONLY valid JSON with this exact shape (no markdown):
-{{"score": <integer 1-10>, "reason": "<one or two short sentences>"}}
-
-=== CANDIDATE RESUME ===
-{resume[:BODY_TEXT_LIMIT]}
-
-=== JOB ===
-Company: {job.company}
-Title: {job.title}
-URL: {job.url}
-
-Description:
-{job.description[:BODY_TEXT_LIMIT]}
-"""
+    Returns {"score": int, "reason": str}. On parse failure, score defaults to 0.
+    """
+    job_description = description.strip() or f"(No description available. Title only: {title})"
+    prompt = (
+        f"Here is a job description: {job_description}. "
+        f"Here is my resume: {RESUME_TEXT}. "
+        "On a scale of 1-10, how well does this resume match this role? "
+        "Consider the candidate's coordination experience, agency background, "
+        "client management skills, and any relevant industry overlap. "
+        'Reply with only a JSON object in this format: '
+        '{"score": 8, "reason": "one sentence explanation"}'
+    )
 
     message = client.messages.create(
-        model=model,
-        max_tokens=300,
+        model=CLAUDE_MODEL,
+        max_tokens=CLAUDE_MAX_TOKENS,
         messages=[{"role": "user", "content": prompt}],
     )
 
     text = "".join(
-        block.text for block in message.content if getattr(block, "type", None) == "text"
+        getattr(block, "text", "")
+        for block in message.content
+        if getattr(block, "type", None) == "text"
     ).strip()
 
-    score, reason = _parse_score_response(text)
-    return MatchResult(job=job, score=score, reason=reason)
-
-
-def _parse_score_response(text: str) -> tuple[int, str]:
-    # Strip optional markdown fences
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
+    # Strip optional markdown code fences if the model wraps JSON
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
     try:
         data = json.loads(cleaned)
         score = int(data["score"])
         reason = str(data.get("reason", "")).strip() or "No reason provided."
-        return max(1, min(10, score)), reason
+        return {"score": max(1, min(10, score)), "reason": reason}
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         match = re.search(r'"?score"?\s*[:=]\s*(\d{1,2})', text, re.IGNORECASE)
-        score = int(match.group(1)) if match else 1
-        score = max(1, min(10, score))
-        return score, _clean_text(text)[:400] or "Could not parse model response."
+        score = int(match.group(1)) if match else 0
+        return {
+            "score": max(0, min(10, score)),
+            "reason": cleaned[:300] or "Could not parse Claude response.",
+        }
 
 
 # ---------------------------------------------------------------------------
-# Email
+# Step 5 — Email digest via Gmail SMTP
 # ---------------------------------------------------------------------------
 
 
-def send_match_email(match: MatchResult) -> None:
-    host = os.environ["SMTP_HOST"]
-    port = int(os.getenv("SMTP_PORT", "587"))
-    user = os.environ["SMTP_USER"]
-    password = os.environ["SMTP_PASSWORD"]
-    email_from = os.getenv("EMAIL_FROM", user)
-    email_to = os.environ["EMAIL_TO"]
+def build_digest_body(matches: list[dict[str, Any]]) -> str:
+    """Format the daily digest email body with dividers between jobs."""
+    sections: list[str] = []
+    for m in matches:
+        sections.append(
+            "\n".join(
+                [
+                    f"Job title: {m['title']}",
+                    f"Company: {m['company']}",
+                    f"Link: {m['url']}",
+                    f"Score: {m['score']}/10",
+                    f"Reason: {m['reason']}",
+                ]
+            )
+        )
+    divider = "\n\n" + ("-" * 40) + "\n\n"
+    header = (
+        f"Daily job digest — {len(matches)} match(es) scoring "
+        f"{SCORE_THRESHOLD}+ / 10\n\n"
+    )
+    return header + divider.join(sections) + "\n"
 
-    job = match.job
-    subject = f"[Job match {match.score}/10] {job.title} @ {job.company}"
-    body = f"""New role that looks like a good fit for your resume.
 
-Score: {match.score}/10
-Reason: {match.reason}
+def send_digest_email(matches: list[dict[str, Any]]) -> None:
+    """
+    Send one digest email listing all jobs that scored 7+.
 
-Company: {job.company}
-Title: {job.title}
-URL: {job.url}
+    Uses Gmail SMTP with credentials from the .env file.
+    """
+    gmail_address = os.environ["GMAIL_ADDRESS"]
+    gmail_password = os.environ["GMAIL_APP_PASSWORD"]
+    recipient = os.getenv("EMAIL_TO", gmail_address)
 
---- Job description (truncated) ---
-{job.description[:3000]}
-"""
+    subject = f"Job digest: {len(matches)} strong match(es) — {datetime.now():%Y-%m-%d}"
+    body = build_digest_body(matches)
 
-    msg = EmailMessage()
+    msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = email_from
-    msg["To"] = email_to
-    msg.set_content(body)
+    msg["From"] = gmail_address
+    msg["To"] = recipient
 
-    with smtplib.SMTP(host, port, timeout=30) as smtp:
+    log(f"Sending digest email to {recipient} ({len(matches)} job(s))...")
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
         smtp.ehlo()
-        if port != 25:
-            smtp.starttls()
-            smtp.ehlo()
-        smtp.login(user, password)
+        smtp.starttls()
+        smtp.ehlo()
+        smtp.login(gmail_address, gmail_password)
         smtp.send_message(msg)
-
-    logger.info("Emailed match: %s (%d/10)", job.title, match.score)
+    log("Digest email sent successfully.")
 
 
 # ---------------------------------------------------------------------------
-# Orchestration
+# Full pipeline orchestration
 # ---------------------------------------------------------------------------
 
 
 def require_env() -> None:
+    """Ensure required secrets are present before calling external APIs."""
     missing = [
         key
-        for key in (
-            "ANTHROPIC_API_KEY",
-            "SMTP_HOST",
-            "SMTP_USER",
-            "SMTP_PASSWORD",
-            "EMAIL_TO",
-        )
+        for key in ("ANTHROPIC_API_KEY", "GMAIL_ADDRESS", "GMAIL_APP_PASSWORD")
         if not os.getenv(key)
     ]
     if missing:
         raise SystemExit(
             "Missing required environment variables: "
             + ", ".join(missing)
-            + "\nCopy .env.example to .env and fill in values."
+            + "\nCopy .env.example to .env and fill in your values."
         )
 
 
-def mark_seen(
-    seen: dict[str, Any],
-    job: JobPosting,
-    *,
-    score: int | None = None,
-    reason: str | None = None,
-    notified: bool = False,
-) -> None:
-    entry: dict[str, Any] = {
-        "company": job.company,
-        "title": job.title,
-        "url": job.url,
-        "first_seen": datetime.now(timezone.utc).isoformat(),
-        "notified": notified,
-    }
-    if score is not None:
-        entry["score"] = score
-    if reason is not None:
-        entry["reason"] = reason
-    # Preserve original first_seen if re-processing somehow
-    existing = seen["jobs"].get(job.job_id)
-    if existing and "first_seen" in existing:
-        entry["first_seen"] = existing["first_seen"]
-    seen["jobs"][job.job_id] = entry
+def run_pipeline() -> None:
+    """
+    Execute the full monitoring pipeline once:
 
-
-def run_once(config: AppConfig) -> None:
+      scrape → keyword filter → unseen check → Claude score → email digest
+    """
+    log("=" * 60)
+    log("Job monitor pipeline starting")
+    log("=" * 60)
     require_env()
-    resume = load_resume(config.resume_path)
-    seen = load_seen_jobs(config.seen_jobs_path)
+
+    seen = load_seen_jobs()
+    seen_keys: set[str] = set(seen.get("jobs", {}).keys())
+    log(f"Loaded {len(seen_keys)} previously seen job(s) from {SEEN_JOBS_PATH.name}")
+
+    # Step 1: scrape
+    scraped = scrape_career_pages()
+
+    # Step 2: keyword filter
+    keyword_jobs = filter_by_keywords(scraped)
+
+    # Step 3: only process jobs not already in seen_jobs.json
+    new_jobs: list[dict[str, str]] = []
+    for job in keyword_jobs:
+        key = job_key(job["title"], job["url"])
+        if key in seen_keys:
+            continue
+        new_jobs.append(job)
+
+    log(f"New (unseen) keyword-matching jobs to score: {len(new_jobs)}")
+
+    if not new_jobs:
+        log("Nothing new to score. Pipeline complete.")
+        return
+
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    strong_matches: list[dict[str, Any]] = []
 
-    logger.info("Starting scrape of %d company page(s)", len(config.companies))
-    postings = scrape_all(config.companies)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            )
+        )
+        page = context.new_page()
+        page.set_default_timeout(PAGE_TIMEOUT_MS)
 
-    new_jobs = [j for j in postings if j.job_id not in seen["jobs"]]
-    logger.info(
-        "Scraped %d posting(s); %d new",
-        len(postings),
-        len(new_jobs),
-    )
+        for i, job in enumerate(new_jobs, start=1):
+            key = job_key(job["title"], job["url"])
+            log(
+                f"Scoring [{i}/{len(new_jobs)}] {job['title']} @ {job['company']}"
+            )
+            try:
+                # Fetch description for richer Claude context
+                description = fetch_job_description(page, job["url"])
+                result = score_job_with_claude(client, job["title"], description)
+                score = int(result["score"])
+                reason = str(result["reason"])
+                log(f"  → {score}/10 — {reason}")
 
-    for job in new_jobs:
+                entry = {
+                    "title": job["title"],
+                    "url": job["url"],
+                    "company": job["company"],
+                    "source_url": job.get("source_url", ""),
+                    "score": score,
+                    "reason": reason,
+                    "first_seen": datetime.now().isoformat(timespec="seconds"),
+                }
+                seen["jobs"][key] = entry
+                seen_keys.add(key)
+
+                # Persist after each job so a crash mid-run does not re-score forever
+                save_seen_jobs(seen)
+
+                if score >= SCORE_THRESHOLD:
+                    strong_matches.append(
+                        {
+                            "title": job["title"],
+                            "company": job["company"],
+                            "url": job["url"],
+                            "score": score,
+                            "reason": reason,
+                        }
+                    )
+            except Exception as exc:
+                # Leave unseen so the next run can retry scoring
+                log(f"  ERROR scoring {job['url']}: {exc}")
+                traceback.print_exc()
+
+        context.close()
+        browser.close()
+
+    # Step 5: email only if we have strong matches
+    if strong_matches:
+        log(f"{len(strong_matches)} job(s) scored {SCORE_THRESHOLD}+ — sending digest.")
         try:
-            match = score_job(client, config.claude_model, resume, job)
-            logger.info(
-                "Scored %s @ %s → %d/10 (%s)",
-                job.title,
-                job.company,
-                match.score,
-                match.reason,
-            )
-            notified = False
-            if match.score >= config.score_threshold:
-                try:
-                    send_match_email(match)
-                    notified = True
-                except Exception:
-                    logger.exception("Failed to send email for %s", job.url)
-            mark_seen(
-                seen,
-                job,
-                score=match.score,
-                reason=match.reason,
-                notified=notified,
-            )
-            # Persist after each job so a crash mid-run does not re-notify
-            save_seen_jobs(config.seen_jobs_path, seen)
-        except Exception:
-            logger.exception(
-                "Failed to score job %s — leaving unseen so the next run can retry",
-                job.url,
-            )
+            send_digest_email(strong_matches)
+        except Exception as exc:
+            log(f"ERROR sending email: {exc}")
+            traceback.print_exc()
+    else:
+        log(f"No jobs scored {SCORE_THRESHOLD}+ today — skipping email.")
 
-    # Also record jobs that were already known so the file stays informative
-    save_seen_jobs(config.seen_jobs_path, seen)
-    logger.info("Run complete. Seen jobs file: %s", config.seen_jobs_path)
+    log("Pipeline complete.")
 
 
-def run_scheduler(config: AppConfig) -> None:
-    hours = max(1, config.check_interval_hours)
-    logger.info("Scheduling checks every %d hour(s)", hours)
-
-    def job() -> None:
-        try:
-            run_once(config)
-        except Exception:
-            logger.exception("Scheduled run failed")
-
-    # Run immediately, then on the interval
-    job()
-    schedule.every(hours).hours.do(job)
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
+# ---------------------------------------------------------------------------
+# Step 6 — Scheduler / CLI entrypoint
+# ---------------------------------------------------------------------------
 
 
-def build_parser() -> argparse.ArgumentParser:
+def run_scheduler() -> None:
+    """Run the pipeline immediately, then every 24 hours with APScheduler."""
+    log("Scheduler mode: running pipeline now, then every 24 hours.")
+    # First run right away so starting the script is useful immediately
+    try:
+        run_pipeline()
+    except Exception:
+        log("Initial scheduled run failed:")
+        traceback.print_exc()
+
+    scheduler = BlockingScheduler()
+    scheduler.add_job(run_pipeline, "interval", hours=24, id="daily_job_monitor")
+    log("APScheduler started — next run in 24 hours. Press Ctrl+C to stop.")
+    try:
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        log("Scheduler stopped.")
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Load ANTHROPIC_API_KEY, GMAIL_ADDRESS, GMAIL_APP_PASSWORD from .env
+    load_dotenv()
+
     parser = argparse.ArgumentParser(
-        description="Monitor career pages, score new jobs with Claude, email strong matches."
-    )
-    parser.add_argument(
-        "--config",
-        default="config.yaml",
-        help="Path to YAML config (default: config.yaml)",
+        description=(
+            "Monitor career pages, score new jobs with Claude, "
+            "email a digest of strong matches."
+        )
     )
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Run a single check and exit (no 24h loop)",
+        help="Run the full pipeline once and exit (manual trigger).",
     )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable debug logging",
-    )
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
-    args = build_parser().parse_args(argv)
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-    config_path = Path(args.config)
-    if not config_path.exists():
-        example = config_path.with_name("config.example.yaml")
-        raise SystemExit(
-            f"Config not found: {config_path}\n"
-            f"Copy {example} to {config_path} and edit your company URLs."
-        )
-
-    config = load_config(config_path)
+    args = parser.parse_args(argv)
 
     if args.once:
-        run_once(config)
+        # Manual one-shot run
+        run_pipeline()
     else:
-        run_scheduler(config)
+        # Default: keep process alive and check every 24 hours
+        run_scheduler()
     return 0
 
 
