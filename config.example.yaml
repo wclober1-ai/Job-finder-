@@ -1,0 +1,37 @@
+# Copy to config.yaml and customize.
+# Paths are relative to the working directory unless absolute.
+
+resume_path: resume.txt
+seen_jobs_path: seen_jobs.json
+score_threshold: 7
+check_interval_hours: 24
+
+# Claude model used for resume↔job matching
+claude_model: claude-sonnet-4-20250514
+
+# Career pages to monitor.
+# - url: listing page that shows open roles
+# - job_link_selector: CSS selector for anchors that point to individual postings
+# - wait_for_selector: optional; wait until this appears (useful for SPAs)
+# - description_selector: optional; on the job detail page, grab this element's text.
+#   If omitted, the full page body text is used.
+companies:
+  - name: Example Corp
+    url: https://example.com/careers
+    job_link_selector: "a[href*='/jobs/'], a[href*='/careers/']"
+    wait_for_selector: "a[href*='/jobs/']"
+    description_selector: "main, article, .job-description"
+
+  # Greenhouse example:
+  # - name: Acme
+  #   url: https://boards.greenhouse.io/acme
+  #   job_link_selector: "a[href*='/jobs/']"
+  #   wait_for_selector: ".opening a"
+  #   description_selector: "#content, .content"
+
+  # Lever example:
+  # - name: Beta Inc
+  #   url: https://jobs.lever.co/betainc
+  #   job_link_selector: "a.posting-title"
+  #   wait_for_selector: ".posting"
+  #   description_selector: ".content, .section-wrapper"
