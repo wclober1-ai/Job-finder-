@@ -136,6 +136,71 @@ TITLE_BLOCKLIST_SUBSTRINGS = (
     "add to cart",
 )
 
+# Store-floor / retail titles to exclude (we want desk/office roles)
+RETAIL_TITLE_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bsales associate\b",
+        r"\bstore associate\b",
+        r"\bstock associate\b",
+        r"\bstock coordinator\b",
+        r"\binventory associate\b",
+        r"\bcashier\b",
+        r"\bkeyholder\b",
+        r"\bkey holder\b",
+        r"\bsales stylist\b",
+        r"\bstore manager\b",
+        r"\bassistant store manager\b",
+        r"\bshift lead\b",
+        r"\bshift leader\b",
+        r"^retail\b",
+        r"\bretail:\b",
+        r"\bpart[-\s]?time stock\b",
+        r"\bfull[-\s]?time stock\b",
+        r"\boperations coordinator\b.*\b(men's|women's|store|shop)\b",
+        r"\b(men's|women's|store|shop)\b.*\boperations coordinator\b",
+    )
+]
+
+# Text on career landing pages that usually leads to a real job board
+VIEW_JOBS_LINK_HINTS = (
+    "view open",
+    "see open",
+    "search job",
+    "view job",
+    "open position",
+    "current opening",
+    "browse job",
+    "explore career",
+    "explore job",
+    "see all job",
+    "view all job",
+    "join our team",
+    "search openings",
+    "find a job",
+    "apply now",
+)
+
+ATS_HOST_HINTS = (
+    "greenhouse.io",
+    "lever.co",
+    "myworkdayjobs.com",
+    "icims.com",
+    "smartrecruiters.com",
+    "jobvite.com",
+    "ashbyhq.com",
+    "workable.com",
+    "taleo.net",
+    "ultipro.com",
+    "dayforcehcm.com",
+    "paylocity.com",
+    "bamboohr.com",
+    "recruitee.com",
+    "job-boards.",
+    "boards.greenhouse",
+    "jobs.lever",
+)
+
 # URL fragments that are almost never individual job postings
 URL_BLOCKLIST_FRAGMENTS = (
     "/login",
@@ -701,8 +766,36 @@ def matched_keywords(title: str) -> set[str]:
 
 def looks_like_job_url(url: str) -> bool:
     """Return True if the URL path/host looks like an ATS or job posting link."""
-    lower = url.lower()
-    return any(token in lower for token in JOB_URL_TOKENS)
+    parsed = urlparse(url.lower())
+    host = parsed.netloc or ""
+    path_q = f"{parsed.path}?{parsed.query}"
+
+    # ATS hosts are always job-related
+    if any(hint in host for hint in ATS_HOST_HINTS):
+        return True
+
+    # Path tokens only (avoid matching hostnames like careers.example.com)
+    path_tokens = (
+        "/job/",
+        "/jobs/",
+        "/jobs?",
+        "/job?",
+        "/careers/",
+        "/career/",
+        "/position",
+        "/opening",
+        "/vacancy",
+        "/requisition",
+        "/role/",
+        "/apply",
+        "/search-results",
+    )
+    if any(token in path_q for token in path_tokens):
+        return True
+    # Individual posting style: .../job/R-12345
+    if re.search(r"/job/[a-z0-9_-]+", path_q):
+        return True
+    return False
 
 
 def is_blocked_title(title: str) -> bool:
@@ -771,19 +864,28 @@ def is_blocked_url(url: str) -> bool:
     return False
 
 
+def is_retail_store_role(title: str) -> bool:
+    """Return True for store-floor retail roles we do not want to score."""
+    cleaned = re.sub(r"\s+", " ", title).strip()
+    return any(pattern.search(cleaned) for pattern in RETAIL_TITLE_PATTERNS)
+
+
 def is_plausible_job_listing(title: str, url: str) -> bool:
     """
-    Keep only links that look like real job postings.
+    Keep only links that look like real desk/office job postings.
 
     Rules:
       - title must match at least one keyword
       - title/URL must not be on the blocklists
+      - exclude retail/sales-floor roles
       - if the title only matches "weak" keywords (account/brand/events/...),
         the URL must also look job-related
     """
     if not matches_keywords(title):
         return False
     if is_blocked_title(title) or is_blocked_url(url):
+        return False
+    if is_retail_store_role(title):
         return False
 
     hits = matched_keywords(title)
@@ -857,9 +959,12 @@ def extract_job_links(page, page_url: str) -> list[dict[str, str]]:
     visible text and keep ones that look like individual postings.
     """
     # Scroll a few times to trigger lazy-loaded listings
-    for _ in range(3):
-        page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-        page.wait_for_timeout(500)
+    for _ in range(4):
+        try:
+            page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+        except Exception:
+            break
+        page.wait_for_timeout(400)
 
     raw_links = page.eval_on_selector_all(
         "a",
@@ -889,8 +994,8 @@ def extract_job_links(page, page_url: str) -> list[dict[str, str]]:
         if absolute in seen_hrefs:
             continue
 
-        title = text.split("\n")[0].strip()
-        # Drop obvious non-jobs early (login/account/nav/investor links)
+        title = _title_from_generic_link(text, absolute)
+        # Drop obvious non-jobs early (login/account/nav/investor/retail links)
         if not is_plausible_job_listing(title, absolute):
             continue
 
@@ -898,6 +1003,147 @@ def extract_job_links(page, page_url: str) -> list[dict[str, str]]:
         results.append({"title": title, "url": absolute})
 
     return results
+
+
+def _title_from_generic_link(text: str, url: str) -> str:
+    """
+    Recover a usable title when the anchor text is generic (e.g. "View Job").
+
+    Many modern boards use CTA text for the link and put the role name in the URL.
+    """
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    generic = {
+        "view job",
+        "view jobs",
+        "apply",
+        "apply now",
+        "see job",
+        "see role",
+        "job details",
+        "learn more",
+        "read more",
+    }
+    if cleaned.lower() not in generic and len(cleaned) >= 4:
+        return cleaned.split("\n")[0].strip()
+
+    path = urlparse(url).path
+    parts = [p for p in path.split("/") if p]
+    # Pattern: /some-job-slug/job/R-12345
+    if "job" in parts:
+        idx = parts.index("job")
+        if idx > 0:
+            return parts[idx - 1].replace("-", " ").replace("_", " ").strip().title()
+    # Pattern: /jobs/123-some-slug or /job/some-slug
+    for i, part in enumerate(parts):
+        if part in {"jobs", "job", "opening", "position"} and i + 1 < len(parts):
+            slug = parts[i + 1]
+            slug = re.sub(r"^\d+[-_]?", "", slug)
+            if len(slug) > 3 and not slug.isdigit():
+                return slug.replace("-", " ").replace("_", " ").strip().title()
+    return cleaned.split("\n")[0].strip()
+
+
+def discover_job_board_urls(page, page_url: str) -> list[str]:
+    """
+    Find secondary ATS / job-search URLs linked from a career marketing page.
+
+    Many employers only show a "View jobs" button that points at Greenhouse,
+    Lever, Workday, etc. Following those boards is required to see real titles.
+    """
+    raw_links = page.eval_on_selector_all(
+        "a",
+        """elements => elements.map(el => ({
+            text: (el.innerText || el.textContent || '').trim().toLowerCase(),
+            href: el.getAttribute('href') || ''
+        }))""",
+    )
+
+    boards: list[str] = []
+    seen: set[str] = set()
+    page_host = urlparse(page_url).netloc.lower()
+
+    # iframe embeds of ATS boards
+    try:
+        for frame in page.frames:
+            frame_url = (frame.url or "").strip()
+            if not frame_url or frame_url.startswith(("about:", "chrome:", "data:")):
+                continue
+            lower = frame_url.lower()
+            if any(hint in lower for hint in ATS_HOST_HINTS):
+                key = frame_url.rstrip("/").lower()
+                if key not in seen and key != page_url.rstrip("/").lower():
+                    seen.add(key)
+                    boards.append(frame_url)
+    except Exception:
+        pass
+
+    locale_re = re.compile(
+        r"^/[a-z]{2}(?:-[a-z]{2})?/?$",
+        re.IGNORECASE,
+    )
+
+    for item in raw_links:
+        href = (item.get("href") or "").strip()
+        if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
+            continue
+        absolute = urljoin(page_url, href)
+        parsed = urlparse(absolute)
+        key = absolute.rstrip("/").lower()
+        if key in seen or key == page_url.rstrip("/").lower():
+            continue
+        if is_blocked_url(absolute):
+            continue
+        # Skip language-switcher paths like /de/ or /es-es/
+        if locale_re.match(parsed.path or ""):
+            continue
+
+        lower_url = absolute.lower()
+        text = (item.get("text") or "").strip().lower()
+        text_compact = re.sub(r"\s+", " ", text)
+        is_ats = any(hint in lower_url for hint in ATS_HOST_HINTS)
+        is_view_jobs = any(hint in text_compact for hint in VIEW_JOBS_LINK_HINTS)
+        looks_search = any(
+            token in lower_url
+            for token in (
+                "/job",
+                "/jobs",
+                "/search",
+                "/opening",
+                "/position",
+                "myworkdayjobs",
+                "search-results",
+            )
+        )
+        same_host_category = (
+            parsed.netloc.lower() == page_host
+            and any(
+                k in text_compact
+                for k in (
+                    "marketing",
+                    "brand",
+                    "creative",
+                    "communications",
+                    "corporate",
+                    "coordinator",
+                    "partnership",
+                )
+            )
+            and ("career" in lower_url or "/us/" in lower_url or "job" in lower_url)
+        )
+
+        if is_ats or (is_view_jobs and looks_search) or same_host_category:
+            seen.add(key)
+            boards.append(absolute)
+
+    # Prefer ATS hosts / job search paths first
+    boards.sort(
+        key=lambda u: (
+            0 if any(h in u.lower() for h in ATS_HOST_HINTS) else 1,
+            0 if "/jobs" in u.lower() or "search-results" in u.lower() else 1,
+            len(u),
+        )
+    )
+    return boards[:5]
 
 
 def fetch_job_description(page, job_url: str) -> str:
@@ -914,6 +1160,50 @@ def fetch_job_description(page, job_url: str) -> str:
         return ""
 
 
+def _scrape_one_url(context, url: str) -> list[dict[str, str]]:
+    """
+    Scrape one career URL in an isolated page, then follow linked job boards.
+
+    Using a fresh page per employer avoids Playwright "navigation interrupted"
+    failures caused by prior redirects still in flight.
+    """
+    found: list[dict[str, str]] = []
+    seen_job_urls: set[str] = set()
+    pages_to_scan = [url]
+    visited_pages: set[str] = set()
+
+    while pages_to_scan and len(visited_pages) < 5:
+        target = pages_to_scan.pop(0)
+        target_key = target.rstrip("/").lower()
+        if target_key in visited_pages:
+            continue
+        visited_pages.add(target_key)
+
+        page = context.new_page()
+        page.set_default_timeout(PAGE_TIMEOUT_MS)
+        try:
+            page.goto(target, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+            page.wait_for_timeout(1_200)
+
+            for link in extract_job_links(page, page.url or target):
+                if link["url"] in seen_job_urls:
+                    continue
+                seen_job_urls.add(link["url"])
+                found.append(link)
+
+            # Only discover secondary boards from the original career landing page
+            # and the first ATS hop — avoids wandering the whole internet.
+            if len(visited_pages) <= 2:
+                for board in discover_job_board_urls(page, page.url or target):
+                    board_key = board.rstrip("/").lower()
+                    if board_key not in visited_pages:
+                        pages_to_scan.append(board)
+        finally:
+            page.close()
+
+    return found
+
+
 def scrape_career_pages() -> list[dict[str, str]]:
     """
     Visit every career URL with Playwright and collect job title + link pairs.
@@ -921,6 +1211,9 @@ def scrape_career_pages() -> list[dict[str, str]]:
     If one page fails, log the error and continue to the next URL.
     """
     all_jobs: list[dict[str, str]] = []
+    ok_count = 0
+    err_count = 0
+    with_links = 0
     log(f"Starting scrape of {len(CAREER_URLS)} career pages...")
 
     with sync_playwright() as p:
@@ -933,16 +1226,15 @@ def scrape_career_pages() -> list[dict[str, str]]:
             ),
             viewport={"width": 1280, "height": 900},
         )
-        page = context.new_page()
-        page.set_default_timeout(PAGE_TIMEOUT_MS)
 
         for i, url in enumerate(CAREER_URLS, start=1):
             company = company_name_from_url(url)
             log(f"[{i}/{len(CAREER_URLS)}] Scraping {company}: {url}")
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-                page.wait_for_timeout(1_500)
-                links = extract_job_links(page, url)
+                links = _scrape_one_url(context, url)
+                ok_count += 1
+                if links:
+                    with_links += 1
                 log(f"  Found {len(links)} candidate link(s)")
                 for link in links:
                     all_jobs.append(
@@ -954,14 +1246,17 @@ def scrape_career_pages() -> list[dict[str, str]]:
                         }
                     )
             except Exception as exc:
-                # Graceful failure: one bad page must not crash the whole run
+                err_count += 1
+                # Keep logs readable — full tracebacks made failures hard to scan
                 log(f"  ERROR scraping {url}: {exc}")
-                traceback.print_exc()
 
         context.close()
         browser.close()
 
-    log(f"Scrape complete. Total candidate links: {len(all_jobs)}")
+    log(
+        f"Scrape complete. Total candidate links: {len(all_jobs)} "
+        f"(pages ok={ok_count}, with_links={with_links}, errors={err_count})"
+    )
     return all_jobs
 
 
@@ -971,12 +1266,14 @@ def scrape_career_pages() -> list[dict[str, str]]:
 
 
 def filter_by_keywords(jobs: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Keep only plausible job listings whose titles contain a target keyword."""
+    """Keep only plausible desk/office listings whose titles contain a keyword."""
     filtered = [j for j in jobs if is_plausible_job_listing(j["title"], j["url"])]
     dropped = len(jobs) - len(filtered)
+    retail_dropped = sum(1 for j in jobs if is_retail_store_role(j["title"]))
     log(
         f"Listing filter: kept {len(filtered)} of {len(jobs)} "
-        f"(dropped {dropped} false/non-job links; keywords: {', '.join(KEYWORDS)})"
+        f"(dropped {dropped} false/non-desk links, including {retail_dropped} retail; "
+        f"keywords: {', '.join(KEYWORDS)})"
     )
     return filtered
 
@@ -1159,14 +1456,14 @@ def run_pipeline() -> None:
                 "Chrome/122.0.0.0 Safari/537.36"
             )
         )
-        page = context.new_page()
-        page.set_default_timeout(PAGE_TIMEOUT_MS)
 
         for i, job in enumerate(new_jobs, start=1):
             key = job_key(job["title"], job["url"])
             log(
                 f"Scoring [{i}/{len(new_jobs)}] {job['title']} @ {job['company']}"
             )
+            page = context.new_page()
+            page.set_default_timeout(PAGE_TIMEOUT_MS)
             try:
                 # Fetch description for richer Claude context
                 description = fetch_job_description(page, job["url"])
@@ -1222,7 +1519,8 @@ def run_pipeline() -> None:
             except Exception as exc:
                 # Leave unseen so the next run can retry scoring
                 log(f"  ERROR scoring {job['url']}: {exc}")
-                traceback.print_exc()
+            finally:
+                page.close()
 
         context.close()
         browser.close()
