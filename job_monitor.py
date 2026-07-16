@@ -531,7 +531,8 @@ def send_digest_email(matches: list[dict[str, Any]]) -> None:
     Uses Gmail SMTP with credentials from the .env file.
     """
     gmail_address = os.environ["GMAIL_ADDRESS"]
-    gmail_password = os.environ["GMAIL_APP_PASSWORD"]
+    # Google shows App Passwords with spaces; SMTP expects them removed.
+    gmail_password = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
     recipient = os.getenv("EMAIL_TO", gmail_address)
 
     subject = f"Job digest: {len(matches)} strong match(es) — {datetime.now():%Y-%m-%d}"
