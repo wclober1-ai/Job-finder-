@@ -63,6 +63,7 @@ Press `Ctrl+C` to stop the scheduler.
 
 ## Notes
 
+- False listings (login pages, "My Account", investor events, shop/nav links) are filtered out before Claude scoring
 - If one career page fails to load, the error is logged and the script continues to the next URL
 - Console prints status updates throughout each run
 - No email is sent on days when nothing scores 7 or higher

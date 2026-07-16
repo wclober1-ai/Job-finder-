@@ -65,6 +65,188 @@ KEYWORDS = [
     "brand",
 ]
 
+# Keywords that also appear in website nav/footer chrome. Titles that only
+# match these must also have a job-like URL before we treat them as postings.
+WEAK_KEYWORDS = {
+    "account",
+    "brand",
+    "events",
+    "creative",
+    "communications",
+    "marketing",
+}
+
+# Exact / near-exact titles that are almost never real job postings
+TITLE_BLOCKLIST = {
+    "my account",
+    "create account",
+    "account",
+    "sign in",
+    "sign up",
+    "log in",
+    "login",
+    "register",
+    "join",
+    "rewards",
+    "top brands",
+    "brands",
+    "events",
+    "news & events",
+    "news and events",
+    "events and presentations",
+    "privacy policy",
+    "cookie policy",
+    "terms of use",
+    "terms of service",
+    "cart",
+    "checkout",
+    "wishlist",
+    "search",
+    "home",
+    "careers",
+    "jobs",
+    "about us",
+    "contact us",
+    "press",
+    "media",
+    "investors",
+}
+
+# Substrings in titles that signal non-job pages
+TITLE_BLOCKLIST_SUBSTRINGS = (
+    "privacy policy",
+    "cookie policy",
+    "terms of",
+    "data processor",
+    "my account",
+    "create account",
+    "sign in",
+    "log in",
+    "join ",
+    "rewards",
+    "brand design",
+    "top brands",
+    "news & events",
+    "news and events",
+    "events and presentations",
+    "investor",
+    "press and media",
+    "mailing list",
+    "newsletter",
+    "add to cart",
+)
+
+# URL fragments that are almost never individual job postings
+URL_BLOCKLIST_FRAGMENTS = (
+    "/login",
+    "/log-in",
+    "/signin",
+    "/sign-in",
+    "/sign_in",
+    "/signup",
+    "/sign-up",
+    "/register",
+    "/account",
+    "/accounts/",
+    "/userhome",
+    "/user-home",
+    "/userHome",
+    "/privacy",
+    "/cookie",
+    "/cookies",
+    "/terms",
+    "/legal",
+    "/investors",
+    "/investor",
+    "/press-",
+    "/press/",
+    "/media/",
+    "/news-events",
+    "/news-and-events",
+    "/rewards",
+    "/cart",
+    "/checkout",
+    "/wishlist",
+    "/bag",
+    "investors.",
+    "policies.google.com",
+    "account.",
+)
+
+# Positive signals that a URL is likely a real job posting
+JOB_URL_TOKENS = (
+    "/job",
+    "/jobs/",
+    "/jobs?",
+    "/career",
+    "/careers/",
+    "/position",
+    "/opening",
+    "/vacancy",
+    "/requisition",
+    "/role/",
+    "/apply",
+    "greenhouse.io",
+    "boards.greenhouse",
+    "lever.co",
+    "myworkdayjobs.com",
+    "icims.com",
+    "smartrecruiters.com",
+    "jobvite.com",
+    "ashbyhq.com",
+    "workable.com",
+    "taleo.net",
+    "ultipro.com",
+    "dayforcehcm.com",
+    "paylocity.com",
+    "bamboohr.com",
+    "recruitee.com",
+)
+
+# Phrases that suggest scraped page text is a real job description
+JOB_DESCRIPTION_SIGNALS = (
+    "responsibilities",
+    "requirements",
+    "qualifications",
+    "about the role",
+    "about this role",
+    "job description",
+    "what you'll do",
+    "what you will do",
+    "you will",
+    "we're looking for",
+    "we are looking for",
+    "equal opportunity",
+    "apply now",
+    "apply for",
+    "full-time",
+    "part-time",
+    "benefits",
+    "salary",
+    "experience required",
+    "preferred qualifications",
+    "job type",
+    "location",
+)
+
+# Phrases that suggest the page is login/shop/nav noise, not a posting
+NON_JOB_DESCRIPTION_SIGNALS = (
+    "local_rate_limited",
+    "sign in to continue",
+    "please sign in",
+    "create an account",
+    "forgot password",
+    "reset your password",
+    "add to cart",
+    "add to bag",
+    "shopping cart",
+    "newsletter signup",
+    "subscribe to our newsletter",
+    "investor relations",
+    "upcoming events",
+    "financial calendar",
+)
+
 # ---------------------------------------------------------------------------
 # Career pages to monitor (duplicates removed; spaced domains fixed)
 # ---------------------------------------------------------------------------
@@ -255,6 +437,128 @@ def matches_keywords(title: str) -> bool:
     return any(keyword in lower for keyword in KEYWORDS)
 
 
+def matched_keywords(title: str) -> set[str]:
+    """Return which configured keywords appear in the title."""
+    lower = title.lower()
+    return {keyword for keyword in KEYWORDS if keyword in lower}
+
+
+def looks_like_job_url(url: str) -> bool:
+    """Return True if the URL path/host looks like an ATS or job posting link."""
+    lower = url.lower()
+    return any(token in lower for token in JOB_URL_TOKENS)
+
+
+def is_blocked_title(title: str) -> bool:
+    """Return True for nav/account/investor titles that are not job postings."""
+    cleaned = re.sub(r"\s+", " ", title).strip().lower()
+    # Drop trailing UI noise like "(opens in a new tab)"
+    cleaned = re.sub(r"\(.*?\)", "", cleaned).strip(" -–—|:")
+    if cleaned in TITLE_BLOCKLIST:
+        return True
+    return any(fragment in cleaned for fragment in TITLE_BLOCKLIST_SUBSTRINGS)
+
+
+def is_blocked_url(url: str) -> bool:
+    """Return True for login, account, investor, shop, and policy URLs."""
+    lower = url.lower()
+    parsed = urlparse(lower)
+    path = parsed.path or "/"
+    netloc = parsed.netloc or ""
+    haystack = f"{netloc}{path}?{parsed.query}"
+
+    # Path-segment checks avoid false hits like "/accounting" matching "/account"
+    segments = [seg for seg in path.split("/") if seg]
+    blocked_segments = {
+        "login",
+        "log-in",
+        "signin",
+        "sign-in",
+        "sign_in",
+        "signup",
+        "sign-up",
+        "register",
+        "account",
+        "accounts",
+        "userhome",
+        "user-home",
+        "privacy",
+        "cookie",
+        "cookies",
+        "terms",
+        "legal",
+        "investors",
+        "investor",
+        "rewards",
+        "cart",
+        "checkout",
+        "wishlist",
+        "bag",
+    }
+    if any(seg in blocked_segments for seg in segments):
+        return True
+
+    # Host / full-URL fragment checks
+    for fragment in (
+        "investors.",
+        "policies.google.com",
+        "account.",
+        "/press-",
+        "/press/",
+        "/media/",
+        "/news-events",
+        "/news-and-events",
+        "/investor-relations",
+    ):
+        if fragment in haystack:
+            return True
+    return False
+
+
+def is_plausible_job_listing(title: str, url: str) -> bool:
+    """
+    Keep only links that look like real job postings.
+
+    Rules:
+      - title must match at least one keyword
+      - title/URL must not be on the blocklists
+      - if the title only matches "weak" keywords (account/brand/events/...),
+        the URL must also look job-related
+    """
+    if not matches_keywords(title):
+        return False
+    if is_blocked_title(title) or is_blocked_url(url):
+        return False
+
+    hits = matched_keywords(title)
+    strong_hits = hits - WEAK_KEYWORDS
+    if strong_hits:
+        return True
+    # Weak keywords alone are too noisy without a job-like URL
+    return looks_like_job_url(url)
+
+
+def looks_like_job_description(description: str) -> bool:
+    """
+    Heuristic check that scraped page text is a job posting, not a login/shop page.
+
+    Used after fetching the detail page, before spending Claude tokens.
+    """
+    text = (description or "").strip()
+    if len(text) < 180:
+        return False
+
+    lower = text.lower()
+    if any(signal in lower for signal in NON_JOB_DESCRIPTION_SIGNALS):
+        # Allow if the page also has strong job signals (some ATS pages mention sign-in)
+        job_hits = sum(1 for signal in JOB_DESCRIPTION_SIGNALS if signal in lower)
+        if job_hits < 2:
+            return False
+
+    job_hits = sum(1 for signal in JOB_DESCRIPTION_SIGNALS if signal in lower)
+    return job_hits >= 1 or len(text) >= 1_200
+
+
 # ---------------------------------------------------------------------------
 # Step 3 — seen_jobs.json persistence
 # ---------------------------------------------------------------------------
@@ -329,35 +633,13 @@ def extract_job_links(page, page_url: str) -> list[dict[str, str]]:
         if absolute in seen_hrefs:
             continue
 
-        # Prefer links that look job-related; still keep keyword matches later
-        path = urlparse(absolute).path.lower()
-        jobish = any(
-            token in path
-            for token in (
-                "/job",
-                "/jobs",
-                "/career",
-                "/careers",
-                "/position",
-                "/opening",
-                "/vacancy",
-                "/role",
-                "/apply",
-                "greenhouse",
-                "lever.co",
-                "workday",
-                "icims",
-                "smartrecruiters",
-                "jobvite",
-                "ashbyhq",
-            )
-        )
-        # Keep if path looks job-related OR title will pass keyword filter later
-        if not jobish and not matches_keywords(text):
+        title = text.split("\n")[0].strip()
+        # Drop obvious non-jobs early (login/account/nav/investor links)
+        if not is_plausible_job_listing(title, absolute):
             continue
 
         seen_hrefs.add(absolute)
-        results.append({"title": text.split("\n")[0].strip(), "url": absolute})
+        results.append({"title": title, "url": absolute})
 
     return results
 
@@ -433,11 +715,12 @@ def scrape_career_pages() -> list[dict[str, str]]:
 
 
 def filter_by_keywords(jobs: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Keep only jobs whose titles contain at least one keyword."""
-    filtered = [j for j in jobs if matches_keywords(j["title"])]
+    """Keep only plausible job listings whose titles contain a target keyword."""
+    filtered = [j for j in jobs if is_plausible_job_listing(j["title"], j["url"])]
+    dropped = len(jobs) - len(filtered)
     log(
-        f"Keyword filter: {len(filtered)} of {len(jobs)} jobs match "
-        f"({', '.join(KEYWORDS)})"
+        f"Listing filter: kept {len(filtered)} of {len(jobs)} "
+        f"(dropped {dropped} false/non-job links; keywords: {', '.join(KEYWORDS)})"
     )
     return filtered
 
@@ -631,6 +914,25 @@ def run_pipeline() -> None:
             try:
                 # Fetch description for richer Claude context
                 description = fetch_job_description(page, job["url"])
+                if not looks_like_job_description(description):
+                    log(
+                        "  Skipping — page does not look like a real job posting "
+                        "(login/nav/shop/investor text)."
+                    )
+                    # Remember it so we do not keep re-fetching noise links
+                    seen["jobs"][key] = {
+                        "title": job["title"],
+                        "url": job["url"],
+                        "company": job["company"],
+                        "source_url": job.get("source_url", ""),
+                        "score": None,
+                        "reason": "filtered_non_job_page",
+                        "first_seen": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    seen_keys.add(key)
+                    save_seen_jobs(seen)
+                    continue
+
                 result = score_job_with_claude(client, job["title"], description)
                 score = int(result["score"])
                 reason = str(result["reason"])
