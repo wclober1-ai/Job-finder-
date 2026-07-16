@@ -26,15 +26,19 @@ cp config.example.yaml config.yaml
 cp resume.example.txt resume.txt
 ```
 
-Edit:
+You must create and fill these three local files (examples are in the repo):
 
-1. **`.env`** — `ANTHROPIC_API_KEY`, SMTP settings, and `EMAIL_TO`
-2. **`config.yaml`** — company career URLs and CSS selectors for job links
-3. **`resume.txt`** — your resume as plain text
+| File | Required? | What to put in it |
+| --- | --- | --- |
+| `.env` | **Yes** | `ANTHROPIC_API_KEY` (from console.anthropic.com), Gmail SMTP settings, and `EMAIL_TO` |
+| `config.yaml` | **Yes** | Company career URLs (a large starter list is in `config.example.yaml`) |
+| `resume.txt` | **Yes** | Your resume as plain text |
+
+Without an Anthropic key, SMTP credentials, and a non-empty resume, the script will exit or skip scoring.
 
 ### Gmail note
 
-Use an [App Password](https://support.google.com/accounts/answer/185833) with `SMTP_HOST=smtp.gmail.com` and `SMTP_PORT=587`.
+Use an [App Password](https://support.google.com/accounts/answer/185833) (not your normal Gmail password) with `SMTP_HOST=smtp.gmail.com` and `SMTP_PORT=587`. Spaces in the displayed app password are fine — the script strips them.
 
 ## Usage
 
@@ -66,9 +70,9 @@ Each company entry needs:
 | --- | --- | --- |
 | `name` | yes | Display name in emails / logs |
 | `url` | yes | Careers listing page |
-| `job_link_selector` | yes | CSS selector for links to individual jobs |
+| `job_link_selector` | no | CSS selector for links to individual jobs (smart default provided) |
 | `wait_for_selector` | no | Wait until this appears (SPA listings) |
-| `description_selector` | no | On the detail page, extract this element; else use full body text |
+| `description_selector` | no | On the detail page, extract this element; else use smart defaults / body text |
 
 Environment overrides: `SCORE_THRESHOLD`, `CHECK_INTERVAL_HOURS`, `CLAUDE_MODEL`.
 

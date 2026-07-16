@@ -38,6 +38,44 @@ DEFAULT_INTERVAL_HOURS = 24
 NAV_TIMEOUT_MS = 45_000
 BODY_TEXT_LIMIT = 12_000
 
+# Broad selector that matches common ATS / career-site job links.
+DEFAULT_JOB_LINK_SELECTOR = ", ".join(
+    [
+        "a[href*='/job']",
+        "a[href*='/jobs/']",
+        "a[href*='/careers/']",
+        "a[href*='/career/']",
+        "a[href*='/position']",
+        "a[href*='/opening']",
+        "a[href*='myworkdayjobs.com']",
+        "a[href*='greenhouse.io']",
+        "a[href*='lever.co']",
+        "a[href*='icims.com']",
+        "a[href*='smartrecruiters.com']",
+        "a[href*='jobvite.com']",
+        "a[href*='taleo.net']",
+        "a[href*='workable.com']",
+        "a[href*='ashbyhq.com']",
+        "a.posting-title",
+        ".opening a",
+        "[data-automation-id='jobTitle'] a",
+        "a[data-testid*='job']",
+    ]
+)
+DEFAULT_DESCRIPTION_SELECTOR = ", ".join(
+    [
+        "main",
+        "article",
+        "[role='main']",
+        ".job-description",
+        "#content",
+        ".content",
+        "[data-automation-id='jobPostingDescription']",
+        ".section-wrapper",
+        ".posting",
+    ]
+)
+
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -48,9 +86,9 @@ BODY_TEXT_LIMIT = 12_000
 class CompanyConfig:
     name: str
     url: str
-    job_link_selector: str
+    job_link_selector: str = DEFAULT_JOB_LINK_SELECTOR
     wait_for_selector: str | None = None
-    description_selector: str | None = None
+    description_selector: str | None = DEFAULT_DESCRIPTION_SELECTOR
 
 
 @dataclass
@@ -129,9 +167,13 @@ def load_config(path: Path) -> AppConfig:
         CompanyConfig(
             name=c["name"],
             url=c["url"],
-            job_link_selector=c["job_link_selector"],
+            job_link_selector=c.get("job_link_selector") or DEFAULT_JOB_LINK_SELECTOR,
             wait_for_selector=c.get("wait_for_selector"),
-            description_selector=c.get("description_selector"),
+            description_selector=(
+                DEFAULT_DESCRIPTION_SELECTOR
+                if "description_selector" not in c
+                else c.get("description_selector")
+            ),
         )
         for c in companies_raw
     ]
@@ -384,7 +426,8 @@ def send_match_email(match: MatchResult) -> None:
     host = os.environ["SMTP_HOST"]
     port = int(os.getenv("SMTP_PORT", "587"))
     user = os.environ["SMTP_USER"]
-    password = os.environ["SMTP_PASSWORD"]
+    # Gmail App Passwords are often shown with spaces; SMTP expects them removed.
+    password = os.environ["SMTP_PASSWORD"].replace(" ", "")
     email_from = os.getenv("EMAIL_FROM", user)
     email_to = os.environ["EMAIL_TO"]
 
