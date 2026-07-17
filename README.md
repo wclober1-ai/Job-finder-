@@ -49,21 +49,47 @@ Run the pipeline once (manual trigger):
 python job_monitor.py --once
 ```
 
-Run on a **daily midnight** schedule (keeps running until you stop it):
+### System scheduler (recommended)
+
+This keeps running even if you close the terminal.
 
 ```bash
-python job_monitor.py
+# From the project folder, after setup:
+chmod +x scripts/install_cron.sh scripts/uninstall_cron.sh
+./scripts/install_cron.sh
 ```
 
-Also run once immediately, then wait for midnight:
+That installs a **daily midnight** cron job which runs:
 
 ```bash
-python job_monitor.py --now
+python job_monitor.py --once
 ```
 
-Press `Ctrl+C` to stop the scheduler.
+Check / remove it:
 
-Optional `.env` schedule controls:
+```bash
+crontab -l
+./scripts/uninstall_cron.sh
+```
+
+Logs append to `job_monitor.log` in the project folder.
+
+Optional time override when installing:
+
+```bash
+SCHEDULE_HOUR=0 SCHEDULE_MINUTE=30 ./scripts/install_cron.sh   # 12:30 AM
+```
+
+### Alternative: leave the Python scheduler running
+
+```bash
+python job_monitor.py          # wait for midnight
+python job_monitor.py --now    # run once now, then wait for midnight
+```
+
+Press `Ctrl+C` to stop.
+
+Optional `.env` schedule controls (Python scheduler mode):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -71,21 +97,16 @@ Optional `.env` schedule controls:
 | `SCHEDULE_MINUTE` | `0` | Minute |
 | `RUN_ON_START` | `0` | `1` to run once when the scheduler starts |
 
-### Alternative: system cron (Mac/Linux)
-
-If you don’t want to leave the Python process open, schedule a one-shot run:
-
-```bash
-0 0 * * * cd /path/to/Job-finder- && .venv/bin/python job_monitor.py --once >> job_monitor.log 2>&1
-```
-
 ## Files
 
 | File | Purpose |
 | --- | --- |
 | `job_monitor.py` | Main script (career URLs + resume are hardcoded here) |
+| `scripts/install_cron.sh` | Install daily midnight system cron job |
+| `scripts/uninstall_cron.sh` | Remove that cron job |
 | `.env` | Secrets (not committed to git) |
 | `seen_jobs.json` | Created automatically; stores previously seen titles/URLs |
+| `job_monitor.log` | Created by cron runs |
 | `requirements.txt` | Python dependencies |
 
 ## Notes

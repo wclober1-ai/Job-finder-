@@ -1,6 +1,8 @@
 .env
 seen_jobs.json
 seen_jobs.json.tmp
+job_monitor.log
+*.log
 __pycache__/
 *.pyc
 .venv/
