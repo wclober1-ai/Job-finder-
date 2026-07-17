@@ -1817,18 +1817,46 @@ def run_pipeline() -> None:
 
 
 def run_scheduler() -> None:
-    """Run the pipeline immediately, then every 24 hours with APScheduler."""
-    log("Scheduler mode: running pipeline now, then every 24 hours.")
-    # First run right away so starting the script is useful immediately
-    try:
-        run_pipeline()
-    except Exception:
-        log("Initial scheduled run failed:")
-        traceback.print_exc()
+    """
+    Run the pipeline every day at midnight (local time).
+
+    Keep this process running (or use system cron / launchd with --once)
+    so the midnight job can fire.
+    """
+    hour = int(os.getenv("SCHEDULE_HOUR", "0"))
+    minute = int(os.getenv("SCHEDULE_MINUTE", "0"))
+    run_on_start = os.getenv("RUN_ON_START", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    log(
+        f"Scheduler mode: daily at {hour:02d}:{minute:02d} local time "
+        f"(set SCHEDULE_HOUR / SCHEDULE_MINUTE to change)."
+    )
+
+    if run_on_start:
+        log("RUN_ON_START=1 — running pipeline once before waiting for midnight.")
+        try:
+            run_pipeline()
+        except Exception:
+            log("Initial scheduled run failed:")
+            traceback.print_exc()
 
     scheduler = BlockingScheduler()
-    scheduler.add_job(run_pipeline, "interval", hours=24, id="daily_job_monitor")
-    log("APScheduler started — next run in 24 hours. Press Ctrl+C to stop.")
+    scheduler.add_job(
+        run_pipeline,
+        "cron",
+        hour=hour,
+        minute=minute,
+        id="daily_job_monitor",
+    )
+    jobs = scheduler.get_jobs()
+    if jobs and jobs[0].next_run_time:
+        log(f"Next run scheduled for: {jobs[0].next_run_time}")
+    log("APScheduler started. Press Ctrl+C to stop.")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
@@ -1841,8 +1869,8 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Monitor career pages, score new jobs with Claude, "
-            "email a digest of strong matches."
+            "Monitor career pages + keyword job APIs, score with Claude, "
+            "email strong matches."
         )
     )
     parser.add_argument(
@@ -1850,13 +1878,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run the full pipeline once and exit (manual trigger).",
     )
+    parser.add_argument(
+        "--now",
+        action="store_true",
+        help="In scheduler mode, also run once immediately before waiting for midnight.",
+    )
     args = parser.parse_args(argv)
 
     if args.once:
-        # Manual one-shot run
         run_pipeline()
     else:
-        # Default: keep process alive and check every 24 hours
+        if args.now:
+            os.environ["RUN_ON_START"] = "1"
         run_scheduler()
     return 0
 
