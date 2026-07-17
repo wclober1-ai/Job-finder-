@@ -10,7 +10,7 @@ Python script that finds **new** desk/office job postings, scores them against y
 4. **Deduplicate** — Compares against `seen_jobs.json` so each posting is only processed once
 5. **Score** — Sends job + resume to Claude (`claude-sonnet-4-6`) for a 1–10 match score
 6. **Email** — If any jobs score ≥ 7, sends one Gmail digest to `wclober1@gmail.com`
-7. **Schedule** — APScheduler re-runs the pipeline every 24 hours
+7. **Schedule** — Runs every day at **midnight** (local time) when you leave the scheduler running
 
 ## Setup
 
@@ -49,13 +49,35 @@ Run the pipeline once (manual trigger):
 python job_monitor.py --once
 ```
 
-Run on a 24-hour schedule (runs immediately, then every 24 hours):
+Run on a **daily midnight** schedule (keeps running until you stop it):
 
 ```bash
 python job_monitor.py
 ```
 
+Also run once immediately, then wait for midnight:
+
+```bash
+python job_monitor.py --now
+```
+
 Press `Ctrl+C` to stop the scheduler.
+
+Optional `.env` schedule controls:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SCHEDULE_HOUR` | `0` | Hour of day (0 = midnight) |
+| `SCHEDULE_MINUTE` | `0` | Minute |
+| `RUN_ON_START` | `0` | `1` to run once when the scheduler starts |
+
+### Alternative: system cron (Mac/Linux)
+
+If you don’t want to leave the Python process open, schedule a one-shot run:
+
+```bash
+0 0 * * * cd /path/to/Job-finder- && .venv/bin/python job_monitor.py --once >> job_monitor.log 2>&1
+```
 
 ## Files
 
