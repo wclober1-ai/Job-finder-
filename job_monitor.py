@@ -4,10 +4,11 @@ Job monitoring script.
 
 Every 24 hours (or when run manually), this script:
   1. Scrapes a list of company career pages with Playwright
-  2. Keeps only jobs whose titles match target keywords
-  3. Skips jobs already stored in seen_jobs.json
-  4. Scores new jobs against a hardcoded resume via Claude
-  5. Emails a daily digest of jobs scoring 7+ to Gmail
+  2. Pulls broader keyword matches from Adzuna (optional) + RemoteOK/Arbeitnow
+  3. Keeps only desk/office jobs whose titles match target keywords
+  4. Skips jobs already stored in seen_jobs.json
+  5. Scores new jobs against a hardcoded resume via Claude
+  6. Emails a daily digest of jobs scoring 7+ to Gmail
 
 Run once:       python job_monitor.py --once
 Run on schedule: python job_monitor.py
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+import requests
 from anthropic import Anthropic
 from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
@@ -64,6 +66,30 @@ KEYWORDS = [
     "communications",
     "brand",
 ]
+
+# Broader keyword API searches (desk/office focused phrases)
+SEARCH_QUERIES = [
+    "marketing coordinator",
+    "brand coordinator",
+    "account coordinator",
+    "partnerships coordinator",
+    "events coordinator",
+    "communications coordinator",
+    "creative coordinator",
+    "marketing associate",
+    "brand associate",
+    "account associate",
+    "partnerships associate",
+    "brand marketing",
+    "influencer coordinator",
+    "campaign coordinator",
+]
+
+# Terms to push Adzuna away from store-floor noise
+ADZUNA_WHAT_EXCLUDE = (
+    "retail sales associate,sales associate,store associate,"
+    "cashier,barista,stock associate,key holder"
+)
 
 # Keywords that also appear in website nav/footer chrome. Titles that only
 # match these must also have a job-like URL before we treat them as postings.
@@ -770,8 +796,20 @@ def looks_like_job_url(url: str) -> bool:
     host = parsed.netloc or ""
     path_q = f"{parsed.path}?{parsed.query}"
 
-    # ATS hosts are always job-related
+    # ATS hosts / known job boards are always job-related
     if any(hint in host for hint in ATS_HOST_HINTS):
+        return True
+    if any(
+        hint in host
+        for hint in (
+            "remotive.com",
+            "remoteok.com",
+            "remoteok.io",
+            "arbeitnow.com",
+            "adzuna.",
+            "indeed.com",
+        )
+    ):
         return True
 
     # Path tokens only (avoid matching hostnames like careers.example.com)
@@ -789,6 +827,7 @@ def looks_like_job_url(url: str) -> bool:
         "/role/",
         "/apply",
         "/search-results",
+        "/remote-jobs/",
     )
     if any(token in path_q for token in path_tokens):
         return True
@@ -1279,6 +1318,234 @@ def filter_by_keywords(jobs: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Broader keyword job search (Adzuna + Remotive)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_api_job(
+    *,
+    title: str,
+    url: str,
+    company: str,
+    description: str = "",
+    source: str,
+) -> dict[str, str] | None:
+    """Convert an API hit into the same shape used by career-page scraping."""
+    title = re.sub(r"\s+", " ", (title or "")).strip()
+    url = (url or "").strip()
+    company = re.sub(r"\s+", " ", (company or "")).strip() or "Unknown"
+    if not title or not url:
+        return None
+    if not url.startswith("http"):
+        return None
+    if not is_plausible_job_listing(title, url):
+        return None
+    desc = re.sub(r"<[^>]+>", " ", description or "")
+    desc = re.sub(r"\s+", " ", desc).strip()[:DESCRIPTION_CHAR_LIMIT]
+    return {
+        "title": title,
+        "url": url,
+        "company": company,
+        "source_url": f"api:{source}",
+        "description": desc,
+    }
+
+
+def fetch_adzuna_jobs() -> list[dict[str, str]]:
+    """
+    Search Adzuna for desk-job phrases.
+
+    Requires ADZUNA_APP_ID and ADZUNA_APP_KEY (free at https://developer.adzuna.com/).
+    If credentials are missing, this source is skipped.
+    """
+    app_id = os.getenv("ADZUNA_APP_ID", "").strip()
+    app_key = os.getenv("ADZUNA_APP_KEY", "").strip()
+    if not app_id or not app_key:
+        log("Adzuna: skipped (set ADZUNA_APP_ID and ADZUNA_APP_KEY in .env to enable)")
+        return []
+
+    country = os.getenv("ADZUNA_COUNTRY", "us").strip().lower() or "us"
+    where = os.getenv("ADZUNA_WHERE", "").strip()
+    results_per_page = int(os.getenv("ADZUNA_RESULTS_PER_QUERY", "20"))
+    max_pages = int(os.getenv("ADZUNA_MAX_PAGES", "1"))
+
+    jobs: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    log(
+        f"Adzuna: searching {len(SEARCH_QUERIES)} queries "
+        f"(country={country}, where={where or 'anywhere'})"
+    )
+
+    for query in SEARCH_QUERIES:
+        for page_num in range(1, max_pages + 1):
+            url = f"https://api.adzuna.com/v1/api/jobs/{country}/search/{page_num}"
+            params = {
+                "app_id": app_id,
+                "app_key": app_key,
+                "results_per_page": results_per_page,
+                "what": query,
+                "what_exclude": ADZUNA_WHAT_EXCLUDE,
+                "content-type": "application/json",
+            }
+            if where:
+                params["where"] = where
+            try:
+                resp = requests.get(url, params=params, timeout=30)
+                if resp.status_code != 200:
+                    log(f"  Adzuna error for '{query}' page {page_num}: HTTP {resp.status_code}")
+                    break
+                payload = resp.json()
+            except Exception as exc:
+                log(f"  Adzuna request failed for '{query}': {exc}")
+                break
+
+            results = payload.get("results") or []
+            if not results:
+                break
+            kept = 0
+            for item in results:
+                normalized = _normalize_api_job(
+                    title=str(item.get("title") or ""),
+                    url=str(item.get("redirect_url") or item.get("adref") or ""),
+                    company=str((item.get("company") or {}).get("display_name") or ""),
+                    description=str(item.get("description") or ""),
+                    source="adzuna",
+                )
+                if not normalized:
+                    continue
+                key = normalized["url"].rstrip("/").lower()
+                if key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                jobs.append(normalized)
+                kept += 1
+            log(f"  Adzuna '{query}' p{page_num}: {len(results)} hits, kept {kept}")
+
+    log(f"Adzuna: {len(jobs)} unique desk-job listing(s)")
+    return jobs
+
+
+def fetch_remotive_jobs() -> list[dict[str, str]]:
+    """Deprecated alias — Remotive's free endpoint ignores search filters."""
+    return []
+
+
+def fetch_remoteok_jobs() -> list[dict[str, str]]:
+    """
+    Pull recent remote roles from RemoteOK's free public API (no key required).
+    """
+    enabled = os.getenv("REMOTEOK_ENABLED", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        log("RemoteOK: skipped (REMOTEOK_ENABLED=0)")
+        return []
+
+    log("RemoteOK: fetching public feed")
+    try:
+        resp = requests.get(
+            "https://remoteok.com/api",
+            headers={"User-Agent": "JobMonitor/1.0 (+local)"},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            log(f"  RemoteOK error: HTTP {resp.status_code}")
+            return []
+        payload = resp.json()
+    except Exception as exc:
+        log(f"  RemoteOK request failed: {exc}")
+        return []
+
+    jobs: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("position") or item.get("title") or "")
+        url = str(item.get("url") or item.get("apply_url") or "")
+        company = str(item.get("company") or "")
+        description = str(item.get("description") or "")
+        normalized = _normalize_api_job(
+            title=title,
+            url=url,
+            company=company,
+            description=description,
+            source="remoteok",
+        )
+        if not normalized:
+            continue
+        key = normalized["url"].rstrip("/").lower()
+        if key in seen_urls:
+            continue
+        seen_urls.add(key)
+        jobs.append(normalized)
+
+    log(f"RemoteOK: {len(jobs)} unique desk-job listing(s)")
+    return jobs
+
+
+def fetch_arbeitnow_jobs() -> list[dict[str, str]]:
+    """
+    Pull roles from Arbeitnow's free job-board API (no key required).
+    """
+    enabled = os.getenv("ARBEITNOW_ENABLED", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        log("Arbeitnow: skipped (ARBEITNOW_ENABLED=0)")
+        return []
+
+    log("Arbeitnow: fetching public feed")
+    try:
+        resp = requests.get(
+            "https://www.arbeitnow.com/api/job-board-api",
+            headers={"User-Agent": "JobMonitor/1.0 (+local)"},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            log(f"  Arbeitnow error: HTTP {resp.status_code}")
+            return []
+        payload = resp.json()
+    except Exception as exc:
+        log(f"  Arbeitnow request failed: {exc}")
+        return []
+
+    results = payload.get("data") or []
+    jobs: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalize_api_job(
+            title=str(item.get("title") or ""),
+            url=str(item.get("url") or ""),
+            company=str(item.get("company_name") or item.get("company") or ""),
+            description=str(item.get("description") or ""),
+            source="arbeitnow",
+        )
+        if not normalized:
+            continue
+        key = normalized["url"].rstrip("/").lower()
+        if key in seen_urls:
+            continue
+        seen_urls.add(key)
+        jobs.append(normalized)
+
+    log(f"Arbeitnow: {len(jobs)} unique desk-job listing(s)")
+    return jobs
+
+
+def fetch_keyword_api_jobs() -> list[dict[str, str]]:
+    """Combine optional Adzuna + free RemoteOK/Arbeitnow keyword feeds."""
+    combined: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for job in fetch_adzuna_jobs() + fetch_remoteok_jobs() + fetch_arbeitnow_jobs():
+        key = job["url"].rstrip("/").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append(job)
+    log(f"Keyword APIs: {len(combined)} unique listing(s) after merge")
+    return combined
+
+
+# ---------------------------------------------------------------------------
 # Step 4 — Score against resume with Claude
 # ---------------------------------------------------------------------------
 
@@ -1413,7 +1680,7 @@ def run_pipeline() -> None:
     """
     Execute the full monitoring pipeline once:
 
-      scrape → keyword filter → unseen check → Claude score → email digest
+      scrape companies → keyword APIs → filter → unseen check → Claude → email
     """
     log("=" * 60)
     log("Job monitor pipeline starting")
@@ -1424,11 +1691,14 @@ def run_pipeline() -> None:
     seen_keys: set[str] = set(seen.get("jobs", {}).keys())
     log(f"Loaded {len(seen_keys)} previously seen job(s) from {SEEN_JOBS_PATH.name}")
 
-    # Step 1: scrape
+    # Step 1a: scrape configured company career pages
     scraped = scrape_career_pages()
 
-    # Step 2: keyword filter
-    keyword_jobs = filter_by_keywords(scraped)
+    # Step 1b: broader keyword search via job APIs (Adzuna + RemoteOK/Arbeitnow)
+    api_jobs = fetch_keyword_api_jobs()
+
+    # Step 2: keyword / desk-job filter
+    keyword_jobs = filter_by_keywords(scraped + api_jobs)
 
     # Step 3: only process jobs not already in seen_jobs.json
     new_jobs: list[dict[str, str]] = []
@@ -1465,8 +1735,10 @@ def run_pipeline() -> None:
             page = context.new_page()
             page.set_default_timeout(PAGE_TIMEOUT_MS)
             try:
-                # Fetch description for richer Claude context
-                description = fetch_job_description(page, job["url"])
+                # Prefer API-provided description when present; else scrape detail page
+                description = (job.get("description") or "").strip()
+                if len(description) < 180:
+                    description = fetch_job_description(page, job["url"])
                 if not looks_like_job_description(description):
                     log(
                         "  Skipping — page does not look like a real job posting "
