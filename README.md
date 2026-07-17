@@ -1,15 +1,16 @@
 # Job Monitor
 
-Python script that checks a list of company career pages every 24 hours, finds **new** job postings that match target keywords, scores them against your resume with Anthropic Claude, and emails a digest only when jobs score **7 or higher**.
+Python script that finds **new** desk/office job postings, scores them against your resume with Anthropic Claude, and emails a digest only when jobs score **7 or higher**.
 
 ## What it does
 
-1. **Scrape** — Playwright loads each career URL (handles JavaScript-rendered pages) and extracts job titles + links
-2. **Filter** — Keeps titles containing: coordinator, associate, account, marketing, partnerships, events, creative, communications, brand
-3. **Deduplicate** — Compares against `seen_jobs.json` so each posting is only processed once
-4. **Score** — Sends job + resume to Claude (`claude-sonnet-4-6`) for a 1–10 match score
-5. **Email** — If any jobs score ≥ 7, sends one Gmail digest to `wclober1@gmail.com`
-6. **Schedule** — APScheduler re-runs the pipeline every 24 hours
+1. **Scrape companies** — Playwright loads each career URL and extracts job titles + links
+2. **Broader keyword search** — Also queries **RemoteOK** + **Arbeitnow** (free) and optionally **Adzuna** for roles like “marketing coordinator”
+3. **Filter** — Keeps desk titles containing: coordinator, associate, account, marketing, partnerships, events, creative, communications, brand (retail/store roles excluded)
+4. **Deduplicate** — Compares against `seen_jobs.json` so each posting is only processed once
+5. **Score** — Sends job + resume to Claude (`claude-sonnet-4-6`) for a 1–10 match score
+6. **Email** — If any jobs score ≥ 7, sends one Gmail digest to `wclober1@gmail.com`
+7. **Schedule** — Runs every day at **midnight** (local time) when you leave the scheduler running
 
 ## Setup
 
@@ -28,11 +29,15 @@ cp .env.example .env
 
 Edit `.env` and fill in:
 
-| Variable | Description |
-| --- | --- |
-| `ANTHROPIC_API_KEY` | Your Anthropic API key |
-| `GMAIL_ADDRESS` | Sender Gmail address (default: `wclober1@gmail.com`) |
-| `GMAIL_APP_PASSWORD` | [Gmail App Password](https://support.google.com/accounts/answer/185833) (16 characters) |
+| Variable | Required? | Description |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | **Yes** | Your Anthropic API key |
+| `GMAIL_ADDRESS` | **Yes** | Sender Gmail address |
+| `GMAIL_APP_PASSWORD` | **Yes** | [Gmail App Password](https://support.google.com/accounts/answer/185833) |
+| `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` | No | Free keys from [developer.adzuna.com](https://developer.adzuna.com/) for broader US job search |
+| `ADZUNA_WHERE` | No | Optional location, e.g. `California` |
+| `REMOTEOK_ENABLED` | No | `1` (default) to include RemoteOK remote jobs; `0` to disable |
+| `ARBEITNOW_ENABLED` | No | `1` (default) to include Arbeitnow feed; `0` to disable |
 
 > **Gmail tip:** Regular account passwords usually fail with SMTP. Enable 2-Step Verification, then create an App Password and put that in `GMAIL_APP_PASSWORD`.
 
@@ -44,25 +49,72 @@ Run the pipeline once (manual trigger):
 python job_monitor.py --once
 ```
 
-Run on a 24-hour schedule (runs immediately, then every 24 hours):
+### System scheduler (recommended)
+
+This keeps running even if you close the terminal.
 
 ```bash
-python job_monitor.py
+# From the project folder, after setup:
+chmod +x scripts/install_cron.sh scripts/uninstall_cron.sh
+./scripts/install_cron.sh
 ```
 
-Press `Ctrl+C` to stop the scheduler.
+That installs a **daily midnight** cron job which runs:
+
+```bash
+python job_monitor.py --once
+```
+
+Check / remove it:
+
+```bash
+crontab -l
+./scripts/uninstall_cron.sh
+```
+
+Logs append to `job_monitor.log` in the project folder.
+
+Optional time override when installing:
+
+```bash
+SCHEDULE_HOUR=0 SCHEDULE_MINUTE=30 ./scripts/install_cron.sh   # 12:30 AM
+```
+
+### Alternative: leave the Python scheduler running
+
+```bash
+python job_monitor.py          # wait for midnight
+python job_monitor.py --now    # run once now, then wait for midnight
+```
+
+Press `Ctrl+C` to stop.
+
+Optional `.env` schedule controls (Python scheduler mode):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SCHEDULE_HOUR` | `0` | Hour of day (0 = midnight) |
+| `SCHEDULE_MINUTE` | `0` | Minute |
+| `RUN_ON_START` | `0` | `1` to run once when the scheduler starts |
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
 | `job_monitor.py` | Main script (career URLs + resume are hardcoded here) |
+| `scripts/install_cron.sh` | Install daily midnight system cron job |
+| `scripts/uninstall_cron.sh` | Remove that cron job |
 | `.env` | Secrets (not committed to git) |
 | `seen_jobs.json` | Created automatically; stores previously seen titles/URLs |
+| `job_monitor.log` | Created by cron runs |
 | `requirements.txt` | Python dependencies |
 
 ## Notes
 
+- False listings (login pages, "My Account", investor events, shop/nav links) are filtered out before Claude scoring
+- Retail/store-floor roles (sales associate, stock coordinator, etc.) are excluded so desk jobs surface
+- Each employer is scraped in a fresh browser page, and "View jobs" links into Greenhouse/Lever/Workday are followed
+- Keyword APIs expand beyond your pasted company list; Adzuna is optional, RemoteOK/Arbeitnow work with no key
 - If one career page fails to load, the error is logged and the script continues to the next URL
 - Console prints status updates throughout each run
 - No email is sent on days when nothing scores 7 or higher
