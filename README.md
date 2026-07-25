@@ -16,8 +16,8 @@ Python script that checks **advertising holding-company and agency career pages*
 Career pages are hardcoded in `CAREER_SOURCES` inside `job_monitor.py`, covering:
 
 - **Holding companies:** WPP, Publicis Groupe, Dentsu, Havas, Stagwell
-- **Network agencies:** Ogilvy, VML, Grey, Leo, Digitas, McCann, BBDO, TBWA, Omnicom Media, and related PR/media brands
-- **Independents / creatives:** Wieden+Kennedy, Droga5, R/GA, Huge, Mother, Deutsch, Fallon, The Martin Agency, Mischief, and others
+- **Network agencies:** Ogilvy, VML, Grey, Leo, Digitas, McCann, BBDO, DDB/TBWA, FCB, Saatchi, Omnicom Media, and related PR/media brands
+- **Independents / creatives:** Wieden+Kennedy, 72andSunny, Droga5, Anomaly, R/GA, Huge, Mother, Deutsch, Cramer-Krasselt, VaynerMedia, IDEO, Pentagram, Frog, Preacher, Zambezi, GS&F, and others
 
 ## Setup
 
