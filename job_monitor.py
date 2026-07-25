@@ -828,8 +828,8 @@ def build_digest_body(matches: list[dict[str, Any]]) -> str:
         )
     divider = "\n\n" + ("-" * 40) + "\n\n"
     header = (
-        f"Jr. copywriter digest — {len(matches)} agency match(es) scoring "
-        f"{SCORE_THRESHOLD}+ / 10\n\n"
+        f"Jr. copywriter digest (US only) — {len(matches)} agency match(es) "
+        f"scoring {SCORE_THRESHOLD}+ / 10\n\n"
     )
     return header + divider.join(sections) + "\n"
 
@@ -845,7 +845,7 @@ def send_digest_email(matches: list[dict[str, Any]]) -> None:
     recipient = os.getenv("EMAIL_TO", gmail_address)
 
     subject = (
-        f"Jr. copywriter digest: {len(matches)} strong match(es) — "
+        f"Jr. copywriter digest (US): {len(matches)} strong match(es) — "
         f"{datetime.now():%Y-%m-%d}"
     )
     body = build_digest_body(matches)
@@ -1050,8 +1050,9 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Monitor advertising agency career pages for jr. copywriter roles, "
-            "score new jobs with Claude, and email a digest of strong matches."
+            "Monitor advertising agency career pages for US-based jr. "
+            "copywriter roles, score new jobs with Claude, and email a digest "
+            "of strong matches."
         )
     )
     parser.add_argument(
