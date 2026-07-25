@@ -22,8 +22,11 @@ from job_monitor import (
     SCORE_THRESHOLD,
     extract_job_links,
     fetch_job_description,
+    filter_by_us_location,
+    is_clearly_non_us,
     job_key,
     load_seen_jobs,
+    location_is_us,
     matches_keywords,
     save_seen_jobs,
     score_job_with_claude,
@@ -74,6 +77,7 @@ def main() -> int:
                             "url": link["url"],
                             "company": company,
                             "source_url": url,
+                            "link_text": link.get("link_text", link["title"]),
                         }
                     )
             except Exception as exc:
@@ -81,11 +85,17 @@ def main() -> int:
                 errors.append({"company": company, "url": url, "error": str(exc)})
 
         deduped = {job_key(job["title"], job["url"]): job for job in all_jobs}
-        jobs = list(deduped.values())
-        print(f"\nUnique jr. copywriter matches: {len(jobs)}", flush=True)
+        keyword_jobs = list(deduped.values())
+        jobs = filter_by_us_location(keyword_jobs)
+        print(
+            f"\nUnique jr. copywriter matches: {len(keyword_jobs)}; "
+            f"US-location candidates: {len(jobs)}",
+            flush=True,
+        )
 
         strong: list[dict] = []
         scored: list[dict] = []
+        skipped_non_us: list[dict] = []
 
         if api_key and jobs:
             client = Anthropic(api_key=api_key)
@@ -97,6 +107,24 @@ def main() -> int:
                 )
                 try:
                     description = fetch_job_description(page, job["url"])
+                    if not location_is_us(
+                        job.get("title", ""),
+                        job.get("url", ""),
+                        description=description,
+                        link_text=job.get("link_text", ""),
+                    ):
+                        print("  -> skipped (non-US location in job details)", flush=True)
+                        skipped_non_us.append(job)
+                        key = job_key(job["title"], job["url"])
+                        seen.setdefault("jobs", {})[key] = {
+                            **job,
+                            "score": 0,
+                            "reason": "Skipped: location outside the United States.",
+                            "skipped_non_us": True,
+                            "first_seen": datetime.now().isoformat(timespec="seconds"),
+                        }
+                        save_seen_jobs(seen)
+                        continue
                     result = score_job_with_claude(client, job["title"], description)
                     entry = {
                         **job,
@@ -118,7 +146,16 @@ def main() -> int:
                     traceback.print_exc()
         else:
             print("Skipping Claude scoring — ANTHROPIC_API_KEY not set.", flush=True)
-            scored = jobs
+            # Without descriptions, keep title/URL US filter results only
+            scored = [
+                job
+                for job in jobs
+                if not is_clearly_non_us(
+                    job.get("title", ""),
+                    job.get("url", ""),
+                    job.get("link_text", ""),
+                )
+            ]
 
         context.close()
         browser.close()
@@ -134,11 +171,13 @@ def main() -> int:
     payload = {
         "ran_at": datetime.now().isoformat(timespec="seconds"),
         "scored_with_claude": bool(api_key),
+        "us_locations_only": True,
         "emailed": bool(strong and can_email),
         "threshold": SCORE_THRESHOLD,
-        "match_count": len(jobs),
+        "match_count": len(scored),
         "strong_matches": strong,
         "all_keyword_matches": scored,
+        "skipped_non_us_count": len(skipped_non_us) if api_key else max(0, len(keyword_jobs) - len(jobs)),
         "errors": errors,
     }
     OUT.write_text(json.dumps(payload, indent=2), encoding="utf-8")

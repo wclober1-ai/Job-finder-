@@ -6,10 +6,11 @@ Python script that checks **advertising holding-company and agency career pages*
 
 1. **Scrape** — Playwright loads each career URL (handles JavaScript-rendered pages) and extracts job titles + links
 2. **Filter** — Keeps junior copywriter-style titles (`copywriter`, `copywriting`, `junior creative`, etc.) and drops senior / leadership titles (`senior`, `director`, `ECD`, etc.)
-3. **Deduplicate** — Compares against `seen_jobs.json` so each posting is only processed once
-4. **Score** — Sends job + resume to Claude (`claude-sonnet-4-6`) for a 1–10 match score focused on agency copywriting fit
-5. **Email** — If any jobs score ≥ 7, sends one Gmail digest to `wclober1@gmail.com`
-6. **Schedule** — APScheduler re-runs the pipeline every 24 hours
+3. **US only** — Keeps United States locations only (title/URL country codes, then job-description check) to avoid visa issues
+4. **Deduplicate** — Compares against `seen_jobs.json` so each posting is only processed once
+5. **Score** — Sends job + resume to Claude (`claude-sonnet-4-6`) for a 1–10 match score focused on agency copywriting fit
+6. **Email** — If any jobs score ≥ 7, sends one Gmail digest to `wclober1@gmail.com`
+7. **Schedule** — APScheduler re-runs the pipeline every 24 hours
 
 ## Sources
 
