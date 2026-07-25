@@ -160,9 +160,28 @@ def main() -> int:
         context.close()
         browser.close()
 
-    if strong and can_email:
+    emailed = False
+    always_email = os.getenv("ALWAYS_EMAIL_DIGEST", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if can_email and (strong or always_email):
         try:
-            send_digest_email(strong)
+            send_digest_email(
+                strong,
+                stats={
+                    "keyword_matches": len(keyword_jobs),
+                    "scored": len(scored),
+                    "skipped_non_us": (
+                        len(skipped_non_us)
+                        if api_key
+                        else max(0, len(keyword_jobs) - len(jobs))
+                    ),
+                },
+            )
+            emailed = True
             print("Digest email sent.", flush=True)
         except Exception as exc:
             print(f"ERROR sending email: {exc}", flush=True)
@@ -172,7 +191,7 @@ def main() -> int:
         "ran_at": datetime.now().isoformat(timespec="seconds"),
         "scored_with_claude": bool(api_key),
         "us_locations_only": True,
-        "emailed": bool(strong and can_email),
+        "emailed": emailed,
         "threshold": SCORE_THRESHOLD,
         "match_count": len(scored),
         "strong_matches": strong,

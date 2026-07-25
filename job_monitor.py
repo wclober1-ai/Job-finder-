@@ -2,15 +2,17 @@
 """
 Junior copywriter job monitoring script (advertising agencies).
 
-Every 24 hours (or when run manually), this script:
+Every morning (or when run manually), this script:
   1. Scrapes advertising holding-company and agency career pages with Playwright
   2. Keeps only junior / associate copywriter-style titles
-  3. Skips jobs already stored in seen_jobs.json
-  4. Scores new jobs against a hardcoded resume via Claude
-  5. Emails a daily digest of jobs scoring 7+ to Gmail
+  3. Keeps United States locations only (visa-safe)
+  4. Skips jobs already stored in seen_jobs.json
+  5. Scores new jobs against a hardcoded resume via Claude
+  6. Emails a morning digest to Gmail (strong matches and/or a no-hits summary)
 
 Run once:       python job_monitor.py --once
-Run on schedule: python job_monitor.py
+Run on schedule: python job_monitor.py   # 08:00 America/Los_Angeles
+GitHub Actions: .github/workflows/daily-jr-copywriter.yml (morning cron)
 """
 
 from __future__ import annotations
@@ -811,8 +813,33 @@ def score_job_with_claude(
 # ---------------------------------------------------------------------------
 
 
-def build_digest_body(matches: list[dict[str, Any]]) -> str:
+def build_digest_body(
+    matches: list[dict[str, Any]],
+    *,
+    stats: dict[str, int] | None = None,
+) -> str:
     """Format the daily digest email body with dividers between jobs."""
+    stats = stats or {}
+    today = datetime.now().strftime("%Y-%m-%d")
+    header_lines = [
+        f"Jr. copywriter morning digest (US only) — {today}",
+        (
+            f"Strong matches (score {SCORE_THRESHOLD}+): {len(matches)} | "
+            f"New US roles scored: {stats.get('scored', 0)} | "
+            f"Skipped non-US: {stats.get('skipped_non_us', 0)} | "
+            f"Keyword matches seen: {stats.get('keyword_matches', 0)}"
+        ),
+        "",
+    ]
+
+    if not matches:
+        header_lines.append(
+            f"No new US jr. copywriter roles scored {SCORE_THRESHOLD}+ today. "
+            "You're all caught up — the monitor will check again tomorrow morning."
+        )
+        header_lines.append("")
+        return "\n".join(header_lines)
+
     sections: list[str] = []
     for m in matches:
         sections.append(
@@ -827,35 +854,45 @@ def build_digest_body(matches: list[dict[str, Any]]) -> str:
             )
         )
     divider = "\n\n" + ("-" * 40) + "\n\n"
-    header = (
-        f"Jr. copywriter digest (US only) — {len(matches)} agency match(es) "
-        f"scoring {SCORE_THRESHOLD}+ / 10\n\n"
+    header_lines.append(
+        f"{len(matches)} agency match(es) scoring {SCORE_THRESHOLD}+ / 10:"
     )
-    return header + divider.join(sections) + "\n"
+    header_lines.append("")
+    return "\n".join(header_lines) + divider.join(sections) + "\n"
 
 
-def send_digest_email(matches: list[dict[str, Any]]) -> None:
+def send_digest_email(
+    matches: list[dict[str, Any]],
+    *,
+    stats: dict[str, int] | None = None,
+) -> None:
     """
-    Send one digest email listing all jobs that scored 7+.
+    Send the morning digest email via Gmail SMTP.
 
-    Uses Gmail SMTP with credentials from the .env file.
+    Includes strong matches (7+) when present; otherwise a short "no hits" summary.
     """
     gmail_address = os.environ["GMAIL_ADDRESS"]
     gmail_password = os.environ["GMAIL_APP_PASSWORD"]
-    recipient = os.getenv("EMAIL_TO", gmail_address)
+    recipient = os.getenv("EMAIL_TO") or gmail_address
 
-    subject = (
-        f"Jr. copywriter digest (US): {len(matches)} strong match(es) — "
-        f"{datetime.now():%Y-%m-%d}"
-    )
-    body = build_digest_body(matches)
+    if matches:
+        subject = (
+            f"Jr. copywriter digest (US): {len(matches)} strong match(es) — "
+            f"{datetime.now():%Y-%m-%d}"
+        )
+    else:
+        subject = (
+            f"Jr. copywriter digest (US): no strong matches — "
+            f"{datetime.now():%Y-%m-%d}"
+        )
+    body = build_digest_body(matches, stats=stats)
 
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = gmail_address
     msg["To"] = recipient
 
-    log(f"Sending digest email to {recipient} ({len(matches)} job(s))...")
+    log(f"Sending digest email to {recipient} ({len(matches)} strong match(es))...")
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
         smtp.ehlo()
         smtp.starttls()
@@ -920,12 +957,24 @@ def run_pipeline() -> None:
 
     log(f"New (unseen) US jr. copywriter jobs to score: {len(new_jobs)}")
 
+    strong_matches: list[dict[str, Any]] = []
+    scored_count = 0
+    skipped_non_us_count = 0
+
     if not new_jobs:
-        log("Nothing new to score. Pipeline complete.")
+        log("Nothing new to score.")
+        _send_morning_digest(
+            strong_matches,
+            stats={
+                "keyword_matches": len(keyword_jobs),
+                "scored": 0,
+                "skipped_non_us": 0,
+            },
+        )
+        log("Pipeline complete.")
         return
 
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    strong_matches: list[dict[str, Any]] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -954,6 +1003,7 @@ def run_pipeline() -> None:
                     link_text=job.get("link_text", ""),
                 ):
                     log("  → skipped (non-US location in job details)")
+                    skipped_non_us_count += 1
                     seen["jobs"][key] = {
                         "title": job["title"],
                         "url": job["url"],
@@ -971,6 +1021,7 @@ def run_pipeline() -> None:
                 result = score_job_with_claude(client, job["title"], description)
                 score = int(result["score"])
                 reason = str(result["reason"])
+                scored_count += 1
                 log(f"  → {score}/10 — {reason}")
 
                 entry = {
@@ -1006,18 +1057,42 @@ def run_pipeline() -> None:
         context.close()
         browser.close()
 
-    # Step 5: email only if we have strong matches
-    if strong_matches:
-        log(f"{len(strong_matches)} job(s) scored {SCORE_THRESHOLD}+ — sending digest.")
-        try:
-            send_digest_email(strong_matches)
-        except Exception as exc:
-            log(f"ERROR sending email: {exc}")
-            traceback.print_exc()
-    else:
-        log(f"No jobs scored {SCORE_THRESHOLD}+ today — skipping email.")
-
+    _send_morning_digest(
+        strong_matches,
+        stats={
+            "keyword_matches": len(keyword_jobs),
+            "scored": scored_count,
+            "skipped_non_us": skipped_non_us_count,
+        },
+    )
     log("Pipeline complete.")
+
+
+def _send_morning_digest(
+    strong_matches: list[dict[str, Any]],
+    *,
+    stats: dict[str, int],
+) -> None:
+    """Email the morning digest (always on by default via ALWAYS_EMAIL_DIGEST)."""
+    always_email = os.getenv("ALWAYS_EMAIL_DIGEST", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not (strong_matches or always_email):
+        log(f"No jobs scored {SCORE_THRESHOLD}+ today — skipping email.")
+        return
+
+    log(
+        f"Sending morning digest "
+        f"({len(strong_matches)} strong / {stats.get('scored', 0)} scored)..."
+    )
+    try:
+        send_digest_email(strong_matches, stats=stats)
+    except Exception as exc:
+        log(f"ERROR sending email: {exc}")
+        traceback.print_exc()
 
 
 # ---------------------------------------------------------------------------
@@ -1026,8 +1101,11 @@ def run_pipeline() -> None:
 
 
 def run_scheduler() -> None:
-    """Run the pipeline immediately, then every 24 hours with APScheduler."""
-    log("Scheduler mode: running pipeline now, then every 24 hours.")
+    """Run the pipeline immediately, then every morning at 8:00 America/Los_Angeles."""
+    log(
+        "Scheduler mode: running pipeline now, then every morning at "
+        "08:00 America/Los_Angeles."
+    )
     # First run right away so starting the script is useful immediately
     try:
         run_pipeline()
@@ -1035,9 +1113,18 @@ def run_scheduler() -> None:
         log("Initial scheduled run failed:")
         traceback.print_exc()
 
-    scheduler = BlockingScheduler()
-    scheduler.add_job(run_pipeline, "interval", hours=24, id="daily_job_monitor")
-    log("APScheduler started — next run in 24 hours. Press Ctrl+C to stop.")
+    scheduler = BlockingScheduler(timezone="America/Los_Angeles")
+    scheduler.add_job(
+        run_pipeline,
+        "cron",
+        hour=8,
+        minute=0,
+        id="morning_jr_copywriter_monitor",
+    )
+    log(
+        "APScheduler started — next run at 08:00 America/Los_Angeles. "
+        "Press Ctrl+C to stop."
+    )
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
@@ -1051,8 +1138,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Monitor advertising agency career pages for US-based jr. "
-            "copywriter roles, score new jobs with Claude, and email a digest "
-            "of strong matches."
+            "copywriter roles each morning, score new jobs with Claude, and "
+            "email a digest of results."
         )
     )
     parser.add_argument(
@@ -1066,7 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
         # Manual one-shot run
         run_pipeline()
     else:
-        # Default: keep process alive and check every 24 hours
+        # Default: keep process alive and run every morning
         run_scheduler()
     return 0
 

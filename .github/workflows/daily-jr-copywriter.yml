@@ -1,0 +1,61 @@
+# Runs the US jr. copywriter agency monitor every morning and emails results.
+name: Daily jr. copywriter monitor
+
+on:
+  schedule:
+    # 8:00 AM Pacific (15:00 UTC during PDT; 16:00 UTC during PST).
+    # GitHub cron is UTC-only; 15:00 UTC ≈ 8am PDT / 7am PST.
+    - cron: "0 15 * * *"
+  workflow_dispatch: # allow manual "Run workflow" from the Actions tab
+
+concurrency:
+  group: daily-jr-copywriter
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore seen_jobs.json cache
+        uses: actions/cache@v4
+        with:
+          path: seen_jobs.json
+          # New key each run; restore-keys pulls the latest prior cache.
+          key: seen-jobs-${{ github.run_id }}
+          restore-keys: |
+            seen-jobs-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run job monitor once
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          # Always email a morning summary, even when nothing scores 7+.
+          ALWAYS_EMAIL_DIGEST: "1"
+        run: python job_monitor.py --once
+
+      - name: Upload seen_jobs.json artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seen-jobs-${{ github.run_id }}
+          path: seen_jobs.json
+          if-no-files-found: ignore
+          retention-days: 30
