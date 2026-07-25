@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Job monitoring script.
+Junior copywriter job monitoring script (advertising agencies).
 
 Every 24 hours (or when run manually), this script:
-  1. Scrapes a list of company career pages with Playwright
-  2. Keeps only jobs whose titles match target keywords
+  1. Scrapes advertising holding-company and agency career pages with Playwright
+  2. Keeps only junior / associate copywriter-style titles
   3. Skips jobs already stored in seen_jobs.json
   4. Scores new jobs against a hardcoded resume via Claude
   5. Emails a daily digest of jobs scoring 7+ to Gmail
@@ -54,134 +54,96 @@ DESCRIPTION_CHAR_LIMIT = 8_000
 
 # Case-insensitive title keywords — a job is kept if ANY match
 KEYWORDS = [
-    "coordinator",
-    "associate",
-    "account",
-    "marketing",
-    "partnerships",
-    "events",
-    "creative",
-    "communications",
-    "brand",
+    "copywriter",
+    "copy writer",
+    "copywriting",
+    "junior creative",
+    "jr. creative",
+    "jr creative",
+    "associate creative",
+    "copy intern",
+    "copywriting intern",
 ]
 
+# Drop senior / leadership creative titles even if they contain a keyword.
+# Short tokens (sr, vp, ecd) are matched as whole words via regex below.
+EXCLUDE_PHRASES = [
+    "senior",
+    "director",
+    "vice president",
+    "head of",
+    "chief",
+    "group creative",
+    "executive creative",
+    "creative director",
+    "lead copywriter",
+    "principal copywriter",
+]
+EXCLUDE_WORD_RE = re.compile(r"\b(sr|vp|ecd)\b", re.IGNORECASE)
+
 # ---------------------------------------------------------------------------
-# Career pages to monitor (duplicates removed; spaced domains fixed)
+# Advertising holding companies + agency career pages to monitor
+# (company label is used in digests; URLs verified where possible)
 # ---------------------------------------------------------------------------
 
-CAREER_URLS = [
-    "https://careers.gtb.com",
-    "https://www.woolpert.com/careers",
-    "https://www.livenation.com/careers",
-    "https://www.altrarunning.com/careers",
-    "https://www.rothys.com/pages/careers",
-    "https://www.waremalcomb.com/careers",
-    "https://warriors.com/careers",
-    "https://leoburnett.com/careers",
-    "https://www.ddb.com/careers",
-    "https://www.goodbysilverstein.com/careers",
-    "https://careers.kraftheinzcompany.com",
-    "https://careers.mondelezinternational.com",
-    "https://careers.conagrabrands.com",
-    "https://www.abbott.com/careers",
-    "https://www.ingredion.com/careers",
-    "https://careers.mars.com",
-    "https://www.fairlife.com/careers",
-    "https://www.reynoldsconsumerproducts.com/careers",
-    "https://www.fortunebrands.com/careers",
-    "https://www.world.kitchen/careers",
-    "https://www.azekco.com/careers",
-    "https://www.treehousefoods.com/careers",
-    "https://www.lifeway.net/careers",
-    "https://www.usfoods.com/careers",
-    "https://www.blistex.com/careers",
-    "https://www.unilever.com/careers",
-    "https://www.crateandbarrel.com/careers",
-    "https://www.wilson.com/en-us/careers",
-    "https://www.shopakira.com/careers",
-    "https://www.threadless.com/careers",
-    "https://www.fossilgroup.com/careers",
-    "https://careers.levistrauss.com",
-    "https://www.pvh.com/careers",
-    "https://www.hanesbrands.com/careers",
-    "https://www.cintas.com/careers",
-    "https://www.wolverineworldwide.com/careers",
-    "https://www.randabrands.com/careers",
-    "https://www.bradfordexchange.com/careers",
-    "https://www.weathertech.com/careers",
-    "https://www.dainese.com/us/en/careers",
-    "https://www.americanapparel.com/careers",
-    "https://www.medline.com/careers",
-    "https://www.baxter.com/careers",
-    "https://www.pfizer.com/careers",
-    "https://www.zebra.com/careers",
-    "https://www.acco.com/careers",
-    "https://jobs.groupon.com",
-    "https://www.morningstar.com/careers",
-    "https://www.usg.com/careers",
-    "https://www.brunswick.com/careers",
-    "https://www.itw.com/careers",
-    "https://www.stepan.com/careers",
-    "https://www.ryerson.com/careers",
-    "https://www.kemper.com/careers",
-    "https://www.cliffbar.com/our-company/careers",
-    "https://www.harmlessharvest.com/pages/careers",
-    "https://www.fairytalebrownies.com/careers",
-    "https://www.dreyers.com/careers",
-    "https://careers.nestle.com",
-    "https://www.clorox.com/careers",
-    "https://www.del-monte.com/en/careers",
-    "https://www.readyrefresh.com/careers",
-    "https://www.guldensmustard.com/careers",
-    "https://www.philzcoffee.com/careers",
-    "https://www.ghirardelli.com/careers",
-    "https://www.tasteofnature.com/careers",
-    "https://www.miyokos.com/pages/careers",
-    "https://www.ripplefoods.com/careers",
-    "https://www.impossiblefoods.com/careers",
-    "https://www.notmilk.com/careers",
-    "https://www.sossupreme.com/careers",
-    "https://www.evolvausa.com/careers",
-    "https://www.rebbl.co/pages/careers",
-    "https://www.kiva.com/careers",
-    "https://www.allbirds.com/pages/careers",
-    "https://www.everlane.com/careers",
-    "https://www.gap.com/careers",
-    "https://www.gapinc.com/careers",
-    "https://www.levi.com/US/en_US/careers",
-    "https://www.cuyana.com/careers",
-    "https://www.thirdlove.com/pages/careers",
-    "https://www.marinelayer.com/pages/careers",
-    "https://www.dollskill.com/pages/careers",
-    "https://www.outerknown.com/pages/careers",
-    "https://www.buckmason.com/pages/careers",
-    "https://www.taylorstitch.com/pages/careers",
-    "https://www.madewell.com/careers",
-    "https://www.betabrand.com/careers",
-    "https://www.aviatornation.com/pages/careers",
-    "https://www.quayaustralia.com/pages/careers",
-    "https://www.stance.com/pages/careers",
-    "https://www.tracksmith.com/pages/careers",
-    "https://www.vuori.com/pages/careers",
-    "https://www.henkel.com/careers",
-    "https://www.pg.com/careers",
-    "https://www.bayer.com/careers",
-    "https://www.abbvie.com/careers",
-    "https://www.genentech.com/careers",
-    "https://www.gilead.com/careers",
-    "https://www.rigel.com/careers",
-    "https://www.natus.com/careers",
-    "https://www.coopersurgical.com/careers",
-    "https://www.genomichealth.com/careers",
-    "https://www.invitae.com/careers",
-    "https://www.formatherapeutics.com/careers",
-    "https://www.veeva.com/careers",
-    "https://www.natera.com/careers",
-    "https://www.guardanthealth.com/careers",
-    "https://www.10xgenomics.com/careers",
-    "https://www.fluidigm.com/careers",
-    "https://www.pacificbiosciences.com/careers",
+CAREER_SOURCES = [
+    # Holding companies
+    {"company": "WPP", "url": "https://www.wpp.com/en/careers"},
+    {"company": "Publicis Groupe", "url": "https://careers.publicisgroupe.com/jobs"},
+    {"company": "Dentsu", "url": "https://www.dentsu.com/careers"},
+    {"company": "Dentsu US", "url": "https://www.dentsu.com/us/en/careers"},
+    {"company": "Havas", "url": "https://www.havas.com/who-we-are/our-careers/"},
+    {"company": "Stagwell", "url": "https://www.stagwellglobal.com/careers/"},
+    # WPP agencies / networks
+    {"company": "Ogilvy", "url": "https://www.ogilvy.com/careers"},
+    {"company": "VML", "url": "https://www.vml.com/careers"},
+    {"company": "Grey", "url": "https://job-boards.greenhouse.io/grey"},
+    {"company": "WPP Media", "url": "https://welcome.wppmedia.com/"},
+    {"company": "Mindshare", "url": "https://www.mindshareworld.com/careers"},
+    {"company": "AKQA", "url": "https://www.akqa.com/careers/"},
+    # Omnicom agencies / networks (IPG brands now under Omnicom)
+    {"company": "BBDO", "url": "https://www.bbdo.com/"},
+    {"company": "TBWA", "url": "https://tbwa.com/"},
+    {"company": "Omnicom Media", "url": "https://omnicommedia.com/careers/"},
+    {"company": "Hearts & Science", "url": "https://hearts-science.com/"},
+    {"company": "McCann", "url": "https://careers.mccann.com/en_US/careersmccann"},
+    {"company": "Octagon", "url": "https://www.octagon.com/careers/"},
+    {"company": "Weber Shandwick", "url": "https://webershandwick.com/careers"},
+    {"company": "Golin / Ketchum", "url": "https://golinketchum.com/careers-jobs/"},
+    {"company": "FleishmanHillard", "url": "https://fleishmanhillard.com/join-us/"},
+    {"company": "Porter Novelli", "url": "https://porternovelli.com/careers/"},
+    # Publicis agencies
+    {"company": "Leo", "url": "https://careers.publicisgroupe.com/leoburnett/jobs"},
+    {"company": "Digitas", "url": "https://careers.publicisgroupe.com/digitas/jobs"},
+    {"company": "Digitas Site", "url": "https://www.digitas.com/en-us/careers"},
+    {"company": "Starcom", "url": "https://careers.publicisgroupe.com/starcom/jobs"},
+    {"company": "Zenith", "url": "https://careers.publicisgroupe.com/zenith/jobs"},
+    {"company": "Publicis Sapient", "url": "https://careers.publicissapient.com/"},
+    {"company": "BBH", "url": "https://www.bbh.com/us/en/careers.html"},
+    {"company": "Razorfish", "url": "https://www.razorfish.com/careers/"},
+    # Independents & notable creatives
+    {"company": "Wieden+Kennedy", "url": "https://www.wk.com/jobs/"},
+    {"company": "Droga5", "url": "https://droga5.com/careers/"},
+    {"company": "R/GA", "url": "https://rga.com/careers"},
+    {"company": "Huge", "url": "https://www.hugeinc.com/careers/"},
+    {"company": "Mother", "url": "https://www.mother.xyz/careers"},
+    {"company": "Mother London", "url": "https://www.motherlondon.com/careers"},
+    {"company": "Deutsch", "url": "https://www.deutsch.com/careers"},
+    {"company": "Fallon", "url": "https://www.fallon.com/careers"},
+    {"company": "The Martin Agency", "url": "https://job-boards.greenhouse.io/themartinagency"},
+    {"company": "Mischief", "url": "https://mischiefusa.com/careers"},
+    {"company": "Joan", "url": "https://www.joan.co/careers"},
+    {"company": "Code and Theory", "url": "https://www.codeandtheory.com/careers"},
+    {"company": "Instrument", "url": "https://www.instrument.com/careers"},
+    {"company": "Buck", "url": "https://www.buck.co/careers"},
+    {"company": "Lippincott", "url": "https://www.lippincott.com/careers/"},
+    {"company": "Barton Fink", "url": "https://www.bartonfink.com/careers"},
+    {"company": "GS&F", "url": "https://www.gsandf.com/careers"},
 ]
+
+# Flat URL list kept for scrape loop convenience
+CAREER_URLS = [source["url"] for source in CAREER_SOURCES]
+COMPANY_BY_URL = {source["url"]: source["company"] for source in CAREER_SOURCES}
 
 # ---------------------------------------------------------------------------
 # Hardcoded resume text used for Claude match scoring
@@ -235,11 +197,12 @@ def log(message: str) -> None:
 
 
 def company_name_from_url(url: str) -> str:
-    """Derive a readable company name from a career page URL."""
+    """Return the configured company label, or derive one from the URL host."""
+    if url in COMPANY_BY_URL:
+        return COMPANY_BY_URL[url]
     host = urlparse(url).netloc.lower()
-    # Strip leading www. / careers.
-    host = re.sub(r"^(www\.|careers\.|jobs\.)", "", host)
-    # Use the first label (e.g. kraftheinzcompany from kraftheinzcompany.com)
+    # Strip leading www. / careers. / jobs. / job-boards.
+    host = re.sub(r"^(www\.|careers\.|jobs\.|job-boards\.)", "", host)
     label = host.split(".")[0] if host else url
     return label.replace("-", " ").title()
 
@@ -250,9 +213,19 @@ def job_key(title: str, url: str) -> str:
 
 
 def matches_keywords(title: str) -> bool:
-    """Return True if the job title contains any of the target keywords."""
+    """
+    Return True for junior / associate copywriter-style titles.
+
+    Keeps titles that match KEYWORDS and do not look like senior/leadership roles.
+    """
     lower = title.lower()
-    return any(keyword in lower for keyword in KEYWORDS)
+    if not any(keyword in lower for keyword in KEYWORDS):
+        return False
+    if any(exclude in lower for exclude in EXCLUDE_PHRASES):
+        return False
+    if EXCLUDE_WORD_RE.search(title):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -433,11 +406,13 @@ def scrape_career_pages() -> list[dict[str, str]]:
 
 
 def filter_by_keywords(jobs: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Keep only jobs whose titles contain at least one keyword."""
+    """Keep only junior / associate copywriter-style titles."""
     filtered = [j for j in jobs if matches_keywords(j["title"])]
     log(
         f"Keyword filter: {len(filtered)} of {len(jobs)} jobs match "
-        f"({', '.join(KEYWORDS)})"
+        f"jr. copywriter keywords ({', '.join(KEYWORDS)}); "
+        f"excluded senior titles containing "
+        f"({', '.join(EXCLUDE_PHRASES[:6])}…)"
     )
     return filtered
 
@@ -461,9 +436,11 @@ def score_job_with_claude(
     prompt = (
         f"Here is a job description: {job_description}. "
         f"Here is my resume: {RESUME_TEXT}. "
-        "On a scale of 1-10, how well does this resume match this role? "
-        "Consider the candidate's coordination experience, agency background, "
-        "client management skills, and any relevant industry overlap. "
+        "On a scale of 1-10, how well does this resume match this junior / "
+        "associate copywriter role at an advertising agency? "
+        "Prioritize copywriting craft, agency internship/freelance experience, "
+        "campaign concepting, client brand work, and fit for entry-to-junior "
+        "creative roles. Penalize senior-level or non-copywriting roles. "
         'Reply with only a JSON object in this format: '
         '{"score": 8, "reason": "one sentence explanation"}'
     )
@@ -518,7 +495,7 @@ def build_digest_body(matches: list[dict[str, Any]]) -> str:
         )
     divider = "\n\n" + ("-" * 40) + "\n\n"
     header = (
-        f"Daily job digest — {len(matches)} match(es) scoring "
+        f"Jr. copywriter digest — {len(matches)} agency match(es) scoring "
         f"{SCORE_THRESHOLD}+ / 10\n\n"
     )
     return header + divider.join(sections) + "\n"
@@ -534,7 +511,10 @@ def send_digest_email(matches: list[dict[str, Any]]) -> None:
     gmail_password = os.environ["GMAIL_APP_PASSWORD"]
     recipient = os.getenv("EMAIL_TO", gmail_address)
 
-    subject = f"Job digest: {len(matches)} strong match(es) — {datetime.now():%Y-%m-%d}"
+    subject = (
+        f"Jr. copywriter digest: {len(matches)} strong match(es) — "
+        f"{datetime.now():%Y-%m-%d}"
+    )
     body = build_digest_body(matches)
 
     msg = MIMEText(body, "plain", "utf-8")
@@ -579,7 +559,7 @@ def run_pipeline() -> None:
       scrape → keyword filter → unseen check → Claude score → email digest
     """
     log("=" * 60)
-    log("Job monitor pipeline starting")
+    log("Jr. copywriter agency job monitor starting")
     log("=" * 60)
     require_env()
 
@@ -712,8 +692,8 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Monitor career pages, score new jobs with Claude, "
-            "email a digest of strong matches."
+            "Monitor advertising agency career pages for jr. copywriter roles, "
+            "score new jobs with Claude, and email a digest of strong matches."
         )
     )
     parser.add_argument(
