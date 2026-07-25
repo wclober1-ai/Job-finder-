@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Job monitoring script.
+Junior copywriter job monitoring script (advertising agencies).
 
-Every 24 hours (or when run manually), this script:
-  1. Scrapes a list of company career pages with Playwright
-  2. Keeps only jobs whose titles match target keywords
-  3. Skips jobs already stored in seen_jobs.json
-  4. Scores new jobs against a hardcoded resume via Claude
-  5. Emails a daily digest of jobs scoring 7+ to Gmail
+Every morning (or when run manually), this script:
+  1. Scrapes advertising holding-company and agency career pages with Playwright
+  2. Keeps only junior / associate copywriter-style titles
+  3. Keeps United States locations only (visa-safe)
+  4. Skips jobs already stored in seen_jobs.json
+  5. Scores new jobs against a hardcoded resume via Claude
+  6. Emails a morning digest to Gmail (strong matches and/or a no-hits summary)
 
 Run once:       python job_monitor.py --once
-Run on schedule: python job_monitor.py
+Run on schedule: python job_monitor.py   # 08:00 America/Los_Angeles
+GitHub Actions: .github/workflows/daily-jr-copywriter.yml (morning cron)
 """
 
 from __future__ import annotations
@@ -54,134 +56,320 @@ DESCRIPTION_CHAR_LIMIT = 8_000
 
 # Case-insensitive title keywords — a job is kept if ANY match
 KEYWORDS = [
-    "coordinator",
-    "associate",
-    "account",
-    "marketing",
-    "partnerships",
-    "events",
-    "creative",
-    "communications",
-    "brand",
+    "copywriter",
+    "copy writer",
+    "copywriting",
+    "junior creative",
+    "jr. creative",
+    "jr creative",
+    "associate creative",
+    "copy intern",
+    "copywriting intern",
 ]
 
+# Drop senior / leadership creative titles even if they contain a keyword.
+# Short tokens (sr, vp, ecd) are matched as whole words via regex below.
+EXCLUDE_PHRASES = [
+    "senior",
+    "director",
+    "vice president",
+    "head of",
+    "chief",
+    "group creative",
+    "executive creative",
+    "creative director",
+    "lead copywriter",
+    "principal copywriter",
+]
+EXCLUDE_WORD_RE = re.compile(r"\b(sr|vp|ecd)\b", re.IGNORECASE)
+
+# United States-only location filter (visa / work-authorization safe)
+US_LOCATION_PHRASES = [
+    "united states",
+    "u.s.",
+    "u.s.a.",
+    "usa",
+    "us only",
+    "remote - us",
+    "remote us",
+    "remote, us",
+    "remote (us)",
+    "based in the us",
+    "based in the u.s",
+    "new york",
+    "nyc",
+    "los angeles",
+    "chicago",
+    "san francisco",
+    "sf bay",
+    "portland",
+    "seattle",
+    "austin",
+    "dallas",
+    "miami",
+    "atlanta",
+    "boston",
+    "denver",
+    "detroit",
+    "minneapolis",
+    "richmond",
+    "nashville",
+    "philadelphia",
+    "washington, dc",
+    "washington dc",
+    "brooklyn",
+    "manhattan",
+]
+# Non-US country / region cues in title, URL, or description
+NON_US_LOCATION_PHRASES = [
+    "united kingdom",
+    "uk only",
+    "london",
+    "manchester",
+    "canada",
+    "toronto",
+    "vancouver",
+    "montreal",
+    "mexico",
+    "mexico city",
+    "ciudad de méxico",
+    "germany",
+    "deutschland",
+    "berlin",
+    "munich",
+    "münchen",
+    "hamburg",
+    "frankfurt",
+    "düsseldorf",
+    "france",
+    "paris",
+    "spain",
+    "madrid",
+    "barcelona",
+    "italy",
+    "milan",
+    "rome",
+    "netherlands",
+    "amsterdam",
+    "belgium",
+    "brussels",
+    "ireland",
+    "dublin",
+    "australia",
+    "sydney",
+    "melbourne",
+    "new zealand",
+    "auckland",
+    "singapore",
+    "hong kong",
+    "tokyo",
+    "japan",
+    "china",
+    "shanghai",
+    "beijing",
+    "india",
+    "mumbai",
+    "bangalore",
+    "bengaluru",
+    "delhi",
+    "brazil",
+    "são paulo",
+    "sao paulo",
+    "argentina",
+    "colombia",
+    "chile",
+    "peru",
+    "uae",
+    "dubai",
+    "saudi",
+    "riyadh",
+    "south africa",
+    "cape town",
+    "poland",
+    "warsaw",
+    "czech",
+    "prague",
+    "turkey",
+    "istanbul",
+    "indonesia",
+    "jakarta",
+    "philippines",
+    "manila",
+    "malaysia",
+    "kuala lumpur",
+    "lebanon",
+    "beirut",
+    "puerto rico",
+    "remote - uk",
+    "remote uk",
+    "remote, uk",
+    "emea",
+    "apac",
+    "latam",
+]
+# ISO-ish country tokens often embedded in ATS slugs (e.g. VML ...-gb-copywriter)
+NON_US_COUNTRY_CODES = {
+    "ae",
+    "ar",
+    "at",
+    "au",
+    "be",
+    "bg",
+    "br",
+    "ca",
+    "ch",
+    "cl",
+    "cn",
+    "co",
+    "cz",
+    "de",
+    "dk",
+    "es",
+    "fi",
+    "fr",
+    "gb",
+    "gr",
+    "hk",
+    "hu",
+    "id",
+    "ie",
+    "il",
+    "in",
+    "it",
+    "jp",
+    "kr",
+    "lb",
+    "mx",
+    "my",
+    "nl",
+    "no",
+    "nz",
+    "pe",
+    "ph",
+    "pl",
+    "pt",
+    "ro",
+    "ru",
+    "sa",
+    "se",
+    "sg",
+    "th",
+    "tr",
+    "tw",
+    "ua",
+    "uk",
+    "vn",
+    "za",
+}
+US_COUNTRY_CODES = {"us", "usa"}
+# ATS slug patterns like /job/123-gb-copywriter or /jobs/123/gb/
+COUNTRY_CODE_IN_PATH_RE = re.compile(
+    r"(?:/job(?:s)?/|/careers/job/)\d+[-_/]([a-z]{2})(?:[-_/]|$)",
+    re.IGNORECASE,
+)
+# Match lang/locale/country query params, but not unrelated keys like "language="
+LOCALE_QUERY_RE = re.compile(
+    r"(?:^|[?&])(?:lang|locale|country)=([a-z]{2})(?:[-_]([a-z]{2}))?",
+    re.IGNORECASE,
+)
+NON_US_HOST_HINTS = (
+    ".de",
+    ".fr",
+    ".co.uk",
+    ".uk",
+    ".nl",
+    ".ie",
+    ".com.au",
+    ".co.nz",
+    ".com.br",
+    ".co.jp",
+    ".com.mx",
+    "personio.de",
+)
+
 # ---------------------------------------------------------------------------
-# Career pages to monitor (duplicates removed; spaced domains fixed)
+# Advertising holding companies + agency career pages to monitor
+# (company label is used in digests; URLs verified where possible)
 # ---------------------------------------------------------------------------
 
-CAREER_URLS = [
-    "https://careers.gtb.com",
-    "https://www.woolpert.com/careers",
-    "https://www.livenation.com/careers",
-    "https://www.altrarunning.com/careers",
-    "https://www.rothys.com/pages/careers",
-    "https://www.waremalcomb.com/careers",
-    "https://warriors.com/careers",
-    "https://leoburnett.com/careers",
-    "https://www.ddb.com/careers",
-    "https://www.goodbysilverstein.com/careers",
-    "https://careers.kraftheinzcompany.com",
-    "https://careers.mondelezinternational.com",
-    "https://careers.conagrabrands.com",
-    "https://www.abbott.com/careers",
-    "https://www.ingredion.com/careers",
-    "https://careers.mars.com",
-    "https://www.fairlife.com/careers",
-    "https://www.reynoldsconsumerproducts.com/careers",
-    "https://www.fortunebrands.com/careers",
-    "https://www.world.kitchen/careers",
-    "https://www.azekco.com/careers",
-    "https://www.treehousefoods.com/careers",
-    "https://www.lifeway.net/careers",
-    "https://www.usfoods.com/careers",
-    "https://www.blistex.com/careers",
-    "https://www.unilever.com/careers",
-    "https://www.crateandbarrel.com/careers",
-    "https://www.wilson.com/en-us/careers",
-    "https://www.shopakira.com/careers",
-    "https://www.threadless.com/careers",
-    "https://www.fossilgroup.com/careers",
-    "https://careers.levistrauss.com",
-    "https://www.pvh.com/careers",
-    "https://www.hanesbrands.com/careers",
-    "https://www.cintas.com/careers",
-    "https://www.wolverineworldwide.com/careers",
-    "https://www.randabrands.com/careers",
-    "https://www.bradfordexchange.com/careers",
-    "https://www.weathertech.com/careers",
-    "https://www.dainese.com/us/en/careers",
-    "https://www.americanapparel.com/careers",
-    "https://www.medline.com/careers",
-    "https://www.baxter.com/careers",
-    "https://www.pfizer.com/careers",
-    "https://www.zebra.com/careers",
-    "https://www.acco.com/careers",
-    "https://jobs.groupon.com",
-    "https://www.morningstar.com/careers",
-    "https://www.usg.com/careers",
-    "https://www.brunswick.com/careers",
-    "https://www.itw.com/careers",
-    "https://www.stepan.com/careers",
-    "https://www.ryerson.com/careers",
-    "https://www.kemper.com/careers",
-    "https://www.cliffbar.com/our-company/careers",
-    "https://www.harmlessharvest.com/pages/careers",
-    "https://www.fairytalebrownies.com/careers",
-    "https://www.dreyers.com/careers",
-    "https://careers.nestle.com",
-    "https://www.clorox.com/careers",
-    "https://www.del-monte.com/en/careers",
-    "https://www.readyrefresh.com/careers",
-    "https://www.guldensmustard.com/careers",
-    "https://www.philzcoffee.com/careers",
-    "https://www.ghirardelli.com/careers",
-    "https://www.tasteofnature.com/careers",
-    "https://www.miyokos.com/pages/careers",
-    "https://www.ripplefoods.com/careers",
-    "https://www.impossiblefoods.com/careers",
-    "https://www.notmilk.com/careers",
-    "https://www.sossupreme.com/careers",
-    "https://www.evolvausa.com/careers",
-    "https://www.rebbl.co/pages/careers",
-    "https://www.kiva.com/careers",
-    "https://www.allbirds.com/pages/careers",
-    "https://www.everlane.com/careers",
-    "https://www.gap.com/careers",
-    "https://www.gapinc.com/careers",
-    "https://www.levi.com/US/en_US/careers",
-    "https://www.cuyana.com/careers",
-    "https://www.thirdlove.com/pages/careers",
-    "https://www.marinelayer.com/pages/careers",
-    "https://www.dollskill.com/pages/careers",
-    "https://www.outerknown.com/pages/careers",
-    "https://www.buckmason.com/pages/careers",
-    "https://www.taylorstitch.com/pages/careers",
-    "https://www.madewell.com/careers",
-    "https://www.betabrand.com/careers",
-    "https://www.aviatornation.com/pages/careers",
-    "https://www.quayaustralia.com/pages/careers",
-    "https://www.stance.com/pages/careers",
-    "https://www.tracksmith.com/pages/careers",
-    "https://www.vuori.com/pages/careers",
-    "https://www.henkel.com/careers",
-    "https://www.pg.com/careers",
-    "https://www.bayer.com/careers",
-    "https://www.abbvie.com/careers",
-    "https://www.genentech.com/careers",
-    "https://www.gilead.com/careers",
-    "https://www.rigel.com/careers",
-    "https://www.natus.com/careers",
-    "https://www.coopersurgical.com/careers",
-    "https://www.genomichealth.com/careers",
-    "https://www.invitae.com/careers",
-    "https://www.formatherapeutics.com/careers",
-    "https://www.veeva.com/careers",
-    "https://www.natera.com/careers",
-    "https://www.guardanthealth.com/careers",
-    "https://www.10xgenomics.com/careers",
-    "https://www.fluidigm.com/careers",
-    "https://www.pacificbiosciences.com/careers",
+CAREER_SOURCES = [
+    # Holding companies
+    {"company": "WPP", "url": "https://www.wpp.com/en/careers"},
+    {"company": "Publicis Groupe", "url": "https://careers.publicisgroupe.com/jobs"},
+    {"company": "Dentsu", "url": "https://www.dentsu.com/careers"},
+    {"company": "Dentsu US", "url": "https://www.dentsu.com/us/en/careers"},
+    {"company": "Havas", "url": "https://www.havas.com/who-we-are/our-careers/"},
+    {"company": "Stagwell", "url": "https://www.stagwellglobal.com/careers/"},
+    # Holding-network agencies
+    {"company": "Ogilvy", "url": "https://www.ogilvy.com/careers"},
+    {"company": "VML", "url": "https://www.vml.com/careers"},
+    {"company": "Grey", "url": "https://job-boards.greenhouse.io/grey"},
+    {"company": "WPP Media", "url": "https://welcome.wppmedia.com/"},
+    {"company": "Mindshare", "url": "https://www.mindshareworld.com/careers"},
+    {"company": "AKQA", "url": "https://www.akqa.com/careers/"},
+    {"company": "DDB", "url": "https://www.ddb.com/careers"},
+    {"company": "TBWA", "url": "https://tbwa.com/"},
+    {"company": "TBWA Chiat Day", "url": "https://tbwachiatday.com/"},
+    {"company": "Omnicom Media", "url": "https://omnicommedia.com/careers/"},
+    {"company": "McCann", "url": "https://careers.mccann.com/en_US/careersmccann"},
+    {"company": "FCB", "url": "https://www.fcb.com/careers"},
+    {"company": "MullenLowe", "url": "https://www.mullenlowe.com/careers"},
+    {"company": "Octagon", "url": "https://www.octagon.com/careers/"},
+    {"company": "Weber Shandwick", "url": "https://webershandwick.com/careers"},
+    {"company": "Golin / Ketchum", "url": "https://golinketchum.com/careers-jobs/"},
+    {"company": "FleishmanHillard", "url": "https://fleishmanhillard.com/join-us/"},
+    {"company": "Porter Novelli", "url": "https://porternovelli.com/careers/"},
+    {"company": "Leo", "url": "https://careers.publicisgroupe.com/leoburnett/jobs"},
+    {"company": "Leo Constellation", "url": "https://www.leoconstellation.com/careers"},
+    {"company": "Saatchi & Saatchi", "url": "https://careers.publicisgroupe.com/jobs?brand=Saatchi%20%26%20Saatchi"},
+    {"company": "Digitas", "url": "https://careers.publicisgroupe.com/digitas/jobs"},
+    {"company": "Digitas Site", "url": "https://www.digitas.com/en-us/careers"},
+    {"company": "Starcom", "url": "https://careers.publicisgroupe.com/starcom/jobs"},
+    {"company": "Zenith", "url": "https://careers.publicisgroupe.com/zenith/jobs"},
+    {"company": "Publicis Sapient", "url": "https://careers.publicissapient.com/"},
+    {"company": "BBH", "url": "https://www.bbh.com/careers"},
+    {"company": "Sid Lee", "url": "https://www.sidlee.com/careers"},
+    {"company": "Razorfish", "url": "https://www.razorfish.com/careers/"},
+    # Independents & creative shops (US-focused where possible)
+    {"company": "Cramer-Krasselt", "url": "https://c-k.com/careers"},
+    {"company": "VSA Partners", "url": "https://www.vsapartners.com/careers"},
+    {"company": "Slingshot", "url": "https://www.slingshotagency.com/careers"},
+    {"company": "YouTech Agency", "url": "https://www.youtechagency.com/careers"},
+    {"company": "Wieden+Kennedy", "url": "https://www.wk.com/jobs/"},
+    {"company": "72andSunny", "url": "https://www.72andsunny.com/careers"},
+    {"company": "Droga5", "url": "https://droga5.com/careers/"},
+    {"company": "Anomaly", "url": "https://jobs.lever.co/anomaly"},
+    {"company": "Deutsch", "url": "https://www.deutsch.com/careers"},
+    {"company": "Mother", "url": "https://www.mother.xyz/careers"},
+    {"company": "Mother New York", "url": "https://www.mothernewyork.com/careers"},
+    {"company": "R/GA", "url": "https://www.rga.com/careers"},
+    {"company": "Crispin", "url": "https://www.crispin.com/"},
+    {"company": "GS&F", "url": "https://www.gsandf.com/careers"},
+    {"company": "VaynerMedia", "url": "https://www.vaynermedia.com/careers"},
+    {"company": "Huge", "url": "https://www.hugeinc.com/careers/"},
+    {"company": "IDEO", "url": "https://www.ideo.com/careers"},
+    {"company": "Pentagram", "url": "https://www.pentagram.com/careers"},
+    {"company": "Frog", "url": "https://www.frogdesign.com/careers"},
+    {"company": "Wolff Olins", "url": "https://www.wolffolins.com/"},
+    {"company": "Instrument", "url": "https://www.instrument.com/careers"},
+    {"company": "EP+Co / Erwin Penland", "url": "https://www.erwinpenland.com/careers"},
+    {"company": "Preacher", "url": "https://job-boards.greenhouse.io/preacher"},
+    {"company": "Zambezi", "url": "https://www.zambezi.com/careers"},
+    {"company": "Laundry Service / THE·TEAM", "url": "https://247laundryservice.com/careers"},
+    {"company": "Mekanism", "url": "https://www.mekanism.com/"},
+    {"company": "Fallon", "url": "https://www.fallon.com/careers"},
+    {"company": "The Martin Agency", "url": "https://job-boards.greenhouse.io/themartinagency"},
+    {"company": "Mischief", "url": "https://mischiefusa.com/careers"},
+    {"company": "Joan", "url": "https://www.joan.co/careers"},
+    {"company": "Code and Theory", "url": "https://www.codeandtheory.com/careers"},
+    {"company": "Buck", "url": "https://www.buck.co/careers"},
+    {"company": "Lippincott", "url": "https://www.lippincott.com/careers/"},
+    {"company": "Barton Fink", "url": "https://www.bartonfink.com/careers"},
 ]
+
+# Flat URL list kept for scrape loop convenience
+CAREER_URLS = [source["url"] for source in CAREER_SOURCES]
+COMPANY_BY_URL = {source["url"]: source["company"] for source in CAREER_SOURCES}
 
 # ---------------------------------------------------------------------------
 # Hardcoded resume text used for Claude match scoring
@@ -235,11 +423,12 @@ def log(message: str) -> None:
 
 
 def company_name_from_url(url: str) -> str:
-    """Derive a readable company name from a career page URL."""
+    """Return the configured company label, or derive one from the URL host."""
+    if url in COMPANY_BY_URL:
+        return COMPANY_BY_URL[url]
     host = urlparse(url).netloc.lower()
-    # Strip leading www. / careers.
-    host = re.sub(r"^(www\.|careers\.|jobs\.)", "", host)
-    # Use the first label (e.g. kraftheinzcompany from kraftheinzcompany.com)
+    # Strip leading www. / careers. / jobs. / job-boards.
+    host = re.sub(r"^(www\.|careers\.|jobs\.|job-boards\.)", "", host)
     label = host.split(".")[0] if host else url
     return label.replace("-", " ").title()
 
@@ -250,9 +439,100 @@ def job_key(title: str, url: str) -> str:
 
 
 def matches_keywords(title: str) -> bool:
-    """Return True if the job title contains any of the target keywords."""
+    """
+    Return True for junior / associate copywriter-style titles.
+
+    Keeps titles that match KEYWORDS and do not look like senior/leadership roles.
+    """
     lower = title.lower()
-    return any(keyword in lower for keyword in KEYWORDS)
+    if not any(keyword in lower for keyword in KEYWORDS):
+        return False
+    if any(exclude in lower for exclude in EXCLUDE_PHRASES):
+        return False
+    if EXCLUDE_WORD_RE.search(title):
+        return False
+    return True
+
+
+def _host_looks_non_us(url: str) -> bool:
+    """Return True when the job URL host itself suggests a non-US board."""
+    host = urlparse(url).netloc.lower()
+    return any(hint in host for hint in NON_US_HOST_HINTS)
+
+
+def _country_codes_from_url(url: str) -> set[str]:
+    """Extract likely country codes from ATS URL path / locale query params."""
+    codes: set[str] = set()
+    parsed = urlparse(url)
+    path_match = COUNTRY_CODE_IN_PATH_RE.search(parsed.path)
+    if path_match:
+        codes.add(path_match.group(1).lower())
+    # Search the full URL query string with delimiters so lang= matches, not language=
+    query = parsed.query or ""
+    for match in LOCALE_QUERY_RE.finditer("?" + query):
+        lang = (match.group(1) or "").lower()
+        region = (match.group(2) or "").lower()
+        # lang=es-mx / locale=en-US → prefer the region token when present
+        if region:
+            codes.add(region)
+        elif lang in NON_US_COUNTRY_CODES or lang in US_COUNTRY_CODES:
+            codes.add(lang)
+    return codes
+
+
+def _phrase_in_text(phrase: str, text: str) -> bool:
+    """Substring match for multi-word phrases; word-boundary for single tokens."""
+    if " " in phrase or "." in phrase or "-" in phrase or "(" in phrase:
+        return phrase in text
+    return re.search(rf"\b{re.escape(phrase)}\b", text) is not None
+
+
+def location_is_us(
+    title: str,
+    url: str,
+    description: str = "",
+    link_text: str = "",
+) -> bool:
+    """
+    Return True only when the posting looks US-based.
+
+    Strict for visa safety:
+      - reject clear non-US signals in title/URL/description
+      - accept clear US signals
+      - if still ambiguous after a description check, reject
+    """
+    blob = " ".join(
+        part for part in (title, link_text, url, description[:4_000]) if part
+    ).lower()
+
+    if _host_looks_non_us(url):
+        return False
+    codes = _country_codes_from_url(url)
+    if codes & NON_US_COUNTRY_CODES and not (codes & US_COUNTRY_CODES):
+        return False
+    if any(_phrase_in_text(phrase, blob) for phrase in NON_US_LOCATION_PHRASES):
+        return False
+    if codes & US_COUNTRY_CODES:
+        return True
+    if any(_phrase_in_text(phrase, blob) for phrase in US_LOCATION_PHRASES):
+        return True
+
+    # No positive US signal. With a description we can be decisive; without one,
+    # keep the job for a later description check.
+    if description.strip():
+        return False
+    return True
+
+
+def is_clearly_non_us(title: str, url: str, link_text: str = "") -> bool:
+    """Fast reject for listings that are obviously outside the United States."""
+    if _host_looks_non_us(url):
+        return True
+    blob = " ".join(part for part in (title, link_text, url) if part).lower()
+    codes = _country_codes_from_url(url)
+    if codes & NON_US_COUNTRY_CODES and not (codes & US_COUNTRY_CODES):
+        return True
+    return any(_phrase_in_text(phrase, blob) for phrase in NON_US_LOCATION_PHRASES)
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +637,14 @@ def extract_job_links(page, page_url: str) -> list[dict[str, str]]:
             continue
 
         seen_hrefs.add(absolute)
-        results.append({"title": text.split("\n")[0].strip(), "url": absolute})
+        results.append(
+            {
+                "title": text.split("\n")[0].strip(),
+                "url": absolute,
+                # Full anchor text often includes location on later lines
+                "link_text": text,
+            }
+        )
 
     return results
 
@@ -413,6 +700,7 @@ def scrape_career_pages() -> list[dict[str, str]]:
                             "url": link["url"],
                             "company": company,
                             "source_url": url,
+                            "link_text": link.get("link_text", link["title"]),
                         }
                     )
             except Exception as exc:
@@ -433,13 +721,35 @@ def scrape_career_pages() -> list[dict[str, str]]:
 
 
 def filter_by_keywords(jobs: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Keep only jobs whose titles contain at least one keyword."""
+    """Keep only junior / associate copywriter-style titles."""
     filtered = [j for j in jobs if matches_keywords(j["title"])]
     log(
         f"Keyword filter: {len(filtered)} of {len(jobs)} jobs match "
-        f"({', '.join(KEYWORDS)})"
+        f"jr. copywriter keywords ({', '.join(KEYWORDS)}); "
+        f"excluded senior titles containing "
+        f"({', '.join(EXCLUDE_PHRASES[:6])}…)"
     )
     return filtered
+
+
+def filter_by_us_location(jobs: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Drop listings that are clearly outside the United States (title/URL)."""
+    kept: list[dict[str, str]] = []
+    rejected = 0
+    for job in jobs:
+        if is_clearly_non_us(
+            job.get("title", ""),
+            job.get("url", ""),
+            job.get("link_text", ""),
+        ):
+            rejected += 1
+            continue
+        kept.append(job)
+    log(
+        f"US location filter: kept {len(kept)} of {len(jobs)} jobs "
+        f"({rejected} clearly non-US rejected from title/URL)"
+    )
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -461,9 +771,11 @@ def score_job_with_claude(
     prompt = (
         f"Here is a job description: {job_description}. "
         f"Here is my resume: {RESUME_TEXT}. "
-        "On a scale of 1-10, how well does this resume match this role? "
-        "Consider the candidate's coordination experience, agency background, "
-        "client management skills, and any relevant industry overlap. "
+        "On a scale of 1-10, how well does this resume match this junior / "
+        "associate copywriter role at an advertising agency in the United States? "
+        "Prioritize copywriting craft, agency internship/freelance experience, "
+        "campaign concepting, client brand work, and fit for entry-to-junior "
+        "creative roles. Penalize senior-level, non-copywriting, or non-US roles. "
         'Reply with only a JSON object in this format: '
         '{"score": 8, "reason": "one sentence explanation"}'
     )
@@ -501,8 +813,33 @@ def score_job_with_claude(
 # ---------------------------------------------------------------------------
 
 
-def build_digest_body(matches: list[dict[str, Any]]) -> str:
+def build_digest_body(
+    matches: list[dict[str, Any]],
+    *,
+    stats: dict[str, int] | None = None,
+) -> str:
     """Format the daily digest email body with dividers between jobs."""
+    stats = stats or {}
+    today = datetime.now().strftime("%Y-%m-%d")
+    header_lines = [
+        f"Jr. copywriter morning digest (US only) — {today}",
+        (
+            f"Strong matches (score {SCORE_THRESHOLD}+): {len(matches)} | "
+            f"New US roles scored: {stats.get('scored', 0)} | "
+            f"Skipped non-US: {stats.get('skipped_non_us', 0)} | "
+            f"Keyword matches seen: {stats.get('keyword_matches', 0)}"
+        ),
+        "",
+    ]
+
+    if not matches:
+        header_lines.append(
+            f"No new US jr. copywriter roles scored {SCORE_THRESHOLD}+ today. "
+            "You're all caught up — the monitor will check again tomorrow morning."
+        )
+        header_lines.append("")
+        return "\n".join(header_lines)
+
     sections: list[str] = []
     for m in matches:
         sections.append(
@@ -517,32 +854,45 @@ def build_digest_body(matches: list[dict[str, Any]]) -> str:
             )
         )
     divider = "\n\n" + ("-" * 40) + "\n\n"
-    header = (
-        f"Daily job digest — {len(matches)} match(es) scoring "
-        f"{SCORE_THRESHOLD}+ / 10\n\n"
+    header_lines.append(
+        f"{len(matches)} agency match(es) scoring {SCORE_THRESHOLD}+ / 10:"
     )
-    return header + divider.join(sections) + "\n"
+    header_lines.append("")
+    return "\n".join(header_lines) + divider.join(sections) + "\n"
 
 
-def send_digest_email(matches: list[dict[str, Any]]) -> None:
+def send_digest_email(
+    matches: list[dict[str, Any]],
+    *,
+    stats: dict[str, int] | None = None,
+) -> None:
     """
-    Send one digest email listing all jobs that scored 7+.
+    Send the morning digest email via Gmail SMTP.
 
-    Uses Gmail SMTP with credentials from the .env file.
+    Includes strong matches (7+) when present; otherwise a short "no hits" summary.
     """
     gmail_address = os.environ["GMAIL_ADDRESS"]
     gmail_password = os.environ["GMAIL_APP_PASSWORD"]
-    recipient = os.getenv("EMAIL_TO", gmail_address)
+    recipient = os.getenv("EMAIL_TO") or gmail_address
 
-    subject = f"Job digest: {len(matches)} strong match(es) — {datetime.now():%Y-%m-%d}"
-    body = build_digest_body(matches)
+    if matches:
+        subject = (
+            f"Jr. copywriter digest (US): {len(matches)} strong match(es) — "
+            f"{datetime.now():%Y-%m-%d}"
+        )
+    else:
+        subject = (
+            f"Jr. copywriter digest (US): no strong matches — "
+            f"{datetime.now():%Y-%m-%d}"
+        )
+    body = build_digest_body(matches, stats=stats)
 
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = gmail_address
     msg["To"] = recipient
 
-    log(f"Sending digest email to {recipient} ({len(matches)} job(s))...")
+    log(f"Sending digest email to {recipient} ({len(matches)} strong match(es))...")
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
         smtp.ehlo()
         smtp.starttls()
@@ -576,10 +926,11 @@ def run_pipeline() -> None:
     """
     Execute the full monitoring pipeline once:
 
-      scrape → keyword filter → unseen check → Claude score → email digest
+      scrape → keyword filter → US location filter → unseen check →
+      Claude score → email digest
     """
     log("=" * 60)
-    log("Job monitor pipeline starting")
+    log("Jr. copywriter agency job monitor starting (US locations only)")
     log("=" * 60)
     require_env()
 
@@ -593,22 +944,37 @@ def run_pipeline() -> None:
     # Step 2: keyword filter
     keyword_jobs = filter_by_keywords(scraped)
 
+    # Step 2b: drop clearly non-US listings before scoring
+    us_jobs = filter_by_us_location(keyword_jobs)
+
     # Step 3: only process jobs not already in seen_jobs.json
     new_jobs: list[dict[str, str]] = []
-    for job in keyword_jobs:
+    for job in us_jobs:
         key = job_key(job["title"], job["url"])
         if key in seen_keys:
             continue
         new_jobs.append(job)
 
-    log(f"New (unseen) keyword-matching jobs to score: {len(new_jobs)}")
+    log(f"New (unseen) US jr. copywriter jobs to score: {len(new_jobs)}")
+
+    strong_matches: list[dict[str, Any]] = []
+    scored_count = 0
+    skipped_non_us_count = 0
 
     if not new_jobs:
-        log("Nothing new to score. Pipeline complete.")
+        log("Nothing new to score.")
+        _send_morning_digest(
+            strong_matches,
+            stats={
+                "keyword_matches": len(keyword_jobs),
+                "scored": 0,
+                "skipped_non_us": 0,
+            },
+        )
+        log("Pipeline complete.")
         return
 
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    strong_matches: list[dict[str, Any]] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -628,11 +994,34 @@ def run_pipeline() -> None:
                 f"Scoring [{i}/{len(new_jobs)}] {job['title']} @ {job['company']}"
             )
             try:
-                # Fetch description for richer Claude context
+                # Fetch description for richer Claude context + US location check
                 description = fetch_job_description(page, job["url"])
+                if not location_is_us(
+                    job.get("title", ""),
+                    job.get("url", ""),
+                    description=description,
+                    link_text=job.get("link_text", ""),
+                ):
+                    log("  → skipped (non-US location in job details)")
+                    skipped_non_us_count += 1
+                    seen["jobs"][key] = {
+                        "title": job["title"],
+                        "url": job["url"],
+                        "company": job["company"],
+                        "source_url": job.get("source_url", ""),
+                        "score": 0,
+                        "reason": "Skipped: location outside the United States.",
+                        "skipped_non_us": True,
+                        "first_seen": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    seen_keys.add(key)
+                    save_seen_jobs(seen)
+                    continue
+
                 result = score_job_with_claude(client, job["title"], description)
                 score = int(result["score"])
                 reason = str(result["reason"])
+                scored_count += 1
                 log(f"  → {score}/10 — {reason}")
 
                 entry = {
@@ -668,18 +1057,42 @@ def run_pipeline() -> None:
         context.close()
         browser.close()
 
-    # Step 5: email only if we have strong matches
-    if strong_matches:
-        log(f"{len(strong_matches)} job(s) scored {SCORE_THRESHOLD}+ — sending digest.")
-        try:
-            send_digest_email(strong_matches)
-        except Exception as exc:
-            log(f"ERROR sending email: {exc}")
-            traceback.print_exc()
-    else:
-        log(f"No jobs scored {SCORE_THRESHOLD}+ today — skipping email.")
-
+    _send_morning_digest(
+        strong_matches,
+        stats={
+            "keyword_matches": len(keyword_jobs),
+            "scored": scored_count,
+            "skipped_non_us": skipped_non_us_count,
+        },
+    )
     log("Pipeline complete.")
+
+
+def _send_morning_digest(
+    strong_matches: list[dict[str, Any]],
+    *,
+    stats: dict[str, int],
+) -> None:
+    """Email the morning digest (always on by default via ALWAYS_EMAIL_DIGEST)."""
+    always_email = os.getenv("ALWAYS_EMAIL_DIGEST", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not (strong_matches or always_email):
+        log(f"No jobs scored {SCORE_THRESHOLD}+ today — skipping email.")
+        return
+
+    log(
+        f"Sending morning digest "
+        f"({len(strong_matches)} strong / {stats.get('scored', 0)} scored)..."
+    )
+    try:
+        send_digest_email(strong_matches, stats=stats)
+    except Exception as exc:
+        log(f"ERROR sending email: {exc}")
+        traceback.print_exc()
 
 
 # ---------------------------------------------------------------------------
@@ -688,8 +1101,11 @@ def run_pipeline() -> None:
 
 
 def run_scheduler() -> None:
-    """Run the pipeline immediately, then every 24 hours with APScheduler."""
-    log("Scheduler mode: running pipeline now, then every 24 hours.")
+    """Run the pipeline immediately, then every morning at 8:00 America/Los_Angeles."""
+    log(
+        "Scheduler mode: running pipeline now, then every morning at "
+        "08:00 America/Los_Angeles."
+    )
     # First run right away so starting the script is useful immediately
     try:
         run_pipeline()
@@ -697,9 +1113,18 @@ def run_scheduler() -> None:
         log("Initial scheduled run failed:")
         traceback.print_exc()
 
-    scheduler = BlockingScheduler()
-    scheduler.add_job(run_pipeline, "interval", hours=24, id="daily_job_monitor")
-    log("APScheduler started — next run in 24 hours. Press Ctrl+C to stop.")
+    scheduler = BlockingScheduler(timezone="America/Los_Angeles")
+    scheduler.add_job(
+        run_pipeline,
+        "cron",
+        hour=8,
+        minute=0,
+        id="morning_jr_copywriter_monitor",
+    )
+    log(
+        "APScheduler started — next run at 08:00 America/Los_Angeles. "
+        "Press Ctrl+C to stop."
+    )
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
@@ -712,8 +1137,9 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Monitor career pages, score new jobs with Claude, "
-            "email a digest of strong matches."
+            "Monitor advertising agency career pages for US-based jr. "
+            "copywriter roles each morning, score new jobs with Claude, and "
+            "email a digest of results."
         )
     )
     parser.add_argument(
@@ -727,7 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
         # Manual one-shot run
         run_pipeline()
     else:
-        # Default: keep process alive and check every 24 hours
+        # Default: keep process alive and run every morning
         run_scheduler()
     return 0
 
