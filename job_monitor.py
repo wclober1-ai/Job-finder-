@@ -102,10 +102,8 @@ CAREER_SOURCES = [
     {"company": "Mindshare", "url": "https://www.mindshareworld.com/careers"},
     {"company": "AKQA", "url": "https://www.akqa.com/careers/"},
     # Omnicom agencies / networks (IPG brands now under Omnicom)
-    {"company": "BBDO", "url": "https://www.bbdo.com/"},
-    {"company": "TBWA", "url": "https://tbwa.com/"},
+    {"company": "BBDO Germany", "url": "https://bbdo.jobs.personio.de/?language=de"},
     {"company": "Omnicom Media", "url": "https://omnicommedia.com/careers/"},
-    {"company": "Hearts & Science", "url": "https://hearts-science.com/"},
     {"company": "McCann", "url": "https://careers.mccann.com/en_US/careersmccann"},
     {"company": "Octagon", "url": "https://www.octagon.com/careers/"},
     {"company": "Weber Shandwick", "url": "https://webershandwick.com/careers"},
